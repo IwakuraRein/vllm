@@ -706,7 +706,7 @@ class FlashInferImpl(AttentionImpl):
                 assert decode_wrapper._window_left == window_left
                 assert decode_wrapper._logits_soft_cap == (self.logits_soft_cap
                                                         or 0.0)
-            assert decode_wrapper._sm_scale == self.scale
+                assert decode_wrapper._sm_scale == self.scale
             decode_wrapper.run(
                 decode_query,
                 kv_cache_permute,
