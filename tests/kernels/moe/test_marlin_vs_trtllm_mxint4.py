@@ -4,9 +4,14 @@
 
 import pytest
 import torch
-
+import numpy as np
 from vllm.model_executor.layers.fused_moe.fused_marlin_moe import (
     fused_marlin_moe,
+)
+from vllm.model_executor.layers.fused_moe.config import (
+    FusedMoEQuantConfig,
+    int4_w4afp8_moe_quant_config,
+    int4_w4a16_moe_quant_config,
 )
 from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import (
     grouped_topk,
@@ -17,6 +22,16 @@ from vllm.model_executor.layers.quantization.utils.flashinfer_mxint4_moe import 
 from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
 
+from flashinfer import cutlass_fused_moe
+import triton
+from vllm.model_executor.layers.fused_moe import fused_experts
+
+import logging
+from vllm import _custom_ops as ops
+
+from flashinfer.testing.utils import bench_gpu_time_with_cupti
+
+import nvtx
 
 def mxint4_quantize(
     x: torch.Tensor, sf_vec_size: int = 32
@@ -265,3 +280,228 @@ def test_marlin_vs_trtllm_mxint4_moe_kimik2(monkeypatch, m, n, k, e, topk, group
     # Note: Different quantization schemes (UINT4b8 vs signed MXINT4) cause
     # some differences
     torch.testing.assert_close(marlin_output, trtllm_output, atol=0.3, rtol=6.0)
+
+
+def bench_marlin_vs_triton_mxint4_moe(bs, intermediate_size, hidden_size, expert_num, topk, cutlass_schedule=None):
+    group_size = 32
+
+    x = torch.randn((bs, hidden_size), device="cuda", dtype=torch.bfloat16)
+    w13_bf16 = torch.randn((expert_num, 2 * intermediate_size, hidden_size), device="cuda", dtype=torch.bfloat16)
+    w2_bf16 = torch.randn((expert_num, hidden_size, intermediate_size), device="cuda", dtype=torch.bfloat16)
+
+    w13_int4, w13_scales = mxint4_quantize_moe_weights(w13_bf16, group_size)
+    w2_int4, w2_scales = mxint4_quantize_moe_weights(w2_bf16, group_size)
+
+    # DeepSeekV3 routing config (from Kimi-K2-Thinking config.json)
+    # n_group = 1  # n_group from model config
+    # topk_group = 1  # topk_group from model config
+    # routed_scaling = 2.827  # routed_scaling_factor from model config
+    routing_logits = torch.randn((bs, expert_num), device="cuda", dtype=torch.float32) * 1.5
+    routing_bias = torch.randn(expert_num, device="cuda", dtype=torch.float32) * 0.8
+    topk_weights, topk_ids = grouped_topk(
+        hidden_states=x,
+        gating_output=routing_logits,
+        topk=topk,
+        renormalize=False,  # DeepSeekV3 doesn't renormalize
+        num_expert_group=1,
+        topk_group=1,
+        scoring_func="sigmoid",  # DeepSeekV3 uses sigmoid
+        routed_scaling_factor=2.827,
+        e_score_correction_bias=routing_bias,
+    )
+
+
+    ## ================== Cutlass INT4 MoE ==================
+    from vllm.model_executor.layers.fused_moe.cutlass_moe import (
+        cutlass_moe_w4a16_bf16,
+    )
+    device = "cuda"
+    a_strides1_c_strides2 = torch.full(
+        (expert_num,),
+        hidden_size,
+        device=device,
+        dtype=torch.int64,
+    )
+    a_strides2 = torch.full(
+        (expert_num,),
+        intermediate_size,
+        device=device,
+        dtype=torch.int64,
+    )
+    c_strides1 = torch.full(
+        (expert_num,),
+        2 * intermediate_size,
+        device=device,
+        dtype=torch.int64,
+    )
+
+    # S (group-wise scales)
+    # sizeof(StrideS) = 16 bytes, so we need to use 2xint64 to encode it
+    s_strides1 = torch.zeros(
+        (expert_num, 2), device=device, dtype=torch.int64
+    )
+    s_strides1[:, 0] = 2 * intermediate_size
+
+    s_strides2 = torch.zeros(
+        (expert_num, 2), device=device, dtype=torch.int64
+    )
+    s_strides2[:, 0] = hidden_size
+    quant_config=int4_w4a16_moe_quant_config(
+        w1_scale=w13_scales,
+        w2_scale=w2_scales,
+        w1_zp=None,
+        w2_zp=None,
+        block_shape=[0, group_size],
+    )
+    w13_cutlass, b_strides1 = ops.cutlass_reorder_int4b_grouped(w13_int4.view(torch.int32))
+    w2_cutlass, b_strides2 = ops.cutlass_reorder_int4b_grouped(w2_int4.view(torch.int32))
+    cutlass_fn = lambda: cutlass_moe_w4a16_bf16(
+        x,
+        w13_cutlass,
+        w2_cutlass,
+        topk_weights,
+        topk_ids,
+        quant_config=quant_config,
+        activation="silu",
+        global_num_experts=expert_num,
+        expert_map=None,
+        a_strides1=a_strides1_c_strides2,
+        a_strides2=a_strides2,
+        b_strides1=b_strides1,
+        b_strides2=b_strides2,
+        c_strides1=c_strides1,
+        c_strides2=a_strides1_c_strides2,
+        s_strides1=s_strides1,
+        s_strides2=s_strides2,
+        group_size=group_size,
+        maybe_schedule=cutlass_schedule,
+    )
+    with nvtx.annotate("cutlass"):
+        for _ in range(10):
+            cutlass_output = cutlass_fn()
+    # ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
+    #     cutlass_fn, rep=100, quantiles=quantiles
+    # )
+    ms = np.median(bench_gpu_time_with_cupti(cutlass_fn, l2_flush=True, dry_run_iters=10, repeat_iters=100))
+    print(f"    Cutlass: {ms:.2f} ms")
+
+    # ================== Default INT4 MoE ==================
+    # triton_fn = lambda: fused_experts(
+    #     x,
+    #     w13_int4,
+    #     w2_int4,
+    #     topk_weights,
+    #     topk_ids,
+    #     inplace=False,
+    #     activation="silu",
+    #     apply_router_weight_on_input = False, # TODO: need double check
+    #     global_num_experts=expert_num,
+    #     expert_map=None,
+    #     quant_config=int4_w4a16_moe_quant_config(
+    #         w1_scale=w13_scales,
+    #         w2_scale=w2_scales,
+    #         w1_zp=None,
+    #         w2_zp=None,
+    #         block_shape=[0, group_size],
+    #     ),
+    # )
+    # # warmup run
+    # triton_output = triton_fn()
+    # ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
+    #     triton_fn, rep=100, quantiles=quantiles
+    # )
+    # print(f"    Triton: {ms:.2f} ms")
+
+
+
+    # ================== Marlin INT4 MoE ==================
+    w1_marlin, w13_scales_marlin = marlin_quantize_moe_weights(w13_bf16, group_size)
+    w2_marlin, w2_scales_marlin = marlin_quantize_moe_weights(w2_bf16, group_size)
+    marlin_fn = lambda: fused_marlin_moe(
+        x,
+        w1_marlin,
+        w2_marlin,
+        None,
+        None,
+        w13_scales_marlin,
+        w2_scales_marlin,
+        None,  # gating_output not needed when topk_weights/ids provided
+        topk_weights,
+        topk_ids,
+        global_num_experts=expert_num,
+        expert_map=None,
+        global_scale1=None,
+        global_scale2=None,
+        g_idx1=None,
+        g_idx2=None,
+        input_global_scale1=None,
+        input_global_scale2=None,
+        sort_indices1=None,
+        sort_indices2=None,
+        w1_zeros=None,
+        w2_zeros=None,
+        input_dtype=torch.bfloat16,
+        quant_type_id=scalar_types.uint4b8.id,
+        is_k_full=True,
+    )
+    # with nvtx.annotate("marlin"):
+    marlin_output = marlin_fn()
+    # ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
+    #     marlin_fn, rep=100, quantiles=quantiles
+    # )
+    ms = np.median(bench_gpu_time_with_cupti(marlin_fn, l2_flush=True, dry_run_iters=10, repeat_iters=100))
+    print(f"    Marlin: {ms:.2f} ms")
+
+    def MSE(a:torch.Tensor, b:torch.Tensor) -> float:
+        return ((a - b) ** 2).mean().item()
+    bf16_output = torch.zeros((bs, hidden_size), device="cuda", dtype=torch.bfloat16)
+    for token_idx in range(bs):
+        for expert_rank in range(topk):
+            expert_id = topk_ids[token_idx, expert_rank].item()
+            weight = topk_weights[token_idx, expert_rank].item()
+            # w1: [2*n, k] @ [k] -> [2*n]
+            up_gate = x[token_idx] @ w13_bf16[expert_id].T  # [2*n]
+            gate, up = up_gate.chunk(2, dim=0)
+            intermediate = torch.nn.functional.silu(gate) * up  # [n]
+            # w2: [k, n] @ [n] -> [k]
+            expert_out = intermediate @ w2_bf16[expert_id].T  # [k]
+            bf16_output[token_idx] += weight * expert_out
+    # is_triton_close = torch.allclose(triton_output, bf16_output, atol=0.3, rtol=1.0)
+    is_marlin_close = torch.allclose(marlin_output, bf16_output, atol=0.3, rtol=1.0)
+    is_cutlass_close = torch.allclose(cutlass_output, bf16_output, atol=0.3, rtol=1.0)
+    # print(f'    {is_triton_close=}')
+    # print(f'    {is_marlin_close=}')
+    print(f'    {is_cutlass_close=}')
+    # if not is_triton_close:
+    #     print(f'    {triton_output=}')
+    #     print(f'    {bf16_output=}')
+    #     print(f"    MSE: {MSE(triton_output, bf16_output)}")
+
+    if not is_marlin_close:
+        print(f'    {marlin_output=}')
+        print(f'    {bf16_output=}')
+        print(f"    MSE: {MSE(marlin_output, bf16_output)}")
+
+    if not is_cutlass_close:
+        print(f'    {cutlass_output=}')
+        print(f'    {bf16_output=}')
+        print(f"    MSE: {MSE(cutlass_output, bf16_output)}")
+
+if __name__ == "__main__":
+    logging.getLogger().setLevel(logging.ERROR)
+    from vllm.v1.worker.workspace import init_workspace_manager
+    init_workspace_manager(device="cuda")
+    for expert_num, intermediate_size, hidden_size in [(48, 2048, 7168)]:
+        print(f"expert_num={expert_num}, intermediate_size={intermediate_size}, hidden_size={hidden_size}:")
+        for bs in [1]:
+            print(f"  bs={bs}:")
+            # for cutlass_schedule in ["Kernel_128x16_2x1x1_Coop", 'Kernel_256x32_1x1x1_Coop', 'Kernel_256x64_1x1x1_Coop', 'Kernel_256x128_2x1x1_Coop', 'Kernel_128x256_2x1x1_Coop']:
+            for cutlass_schedule in ["Kernel_128x16_2x1x1_Coop"]:
+                print(f"    cutlass_schedule={cutlass_schedule}:")
+                bench_marlin_vs_triton_mxint4_moe(
+                    intermediate_size=intermediate_size,
+                    hidden_size=hidden_size,
+                    bs=bs,
+                    expert_num=expert_num,
+                    topk=1,
+                )

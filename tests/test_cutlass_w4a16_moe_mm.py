@@ -86,7 +86,7 @@ def cutlass_quantize(
 
 
 @pytest.mark.skipif(current_platform.is_rocm(), reason="Skip for rocm")
-@pytest.mark.parametrize("bs", [1, 2, 3, 128, 384])
+@pytest.mark.parametrize("bs", [1, 64, 128, 384])
 @pytest.mark.parametrize("M", [128, 1024, 2048])
 @pytest.mark.parametrize("N", [128, 1024, 2048, 7168])
 @pytest.mark.parametrize("K", [2048, 4096, 7168, 16384, 32768])
@@ -100,10 +100,14 @@ def test_cutlass_w4a16_moe_mm(
     group_size: int,
     maybe_schedule: str | None,
 ):
+    alignment = 16
     torch.random.manual_seed(42)
     device = torch.device("cuda")
     dtype = torch.bfloat16
-    A = torch.randn(bs, M, K, device=device, dtype=dtype)
+    Ms = torch.randint(0, M // alignment, (bs,)) * alignment
+    print(f"{Ms=}")
+    M_full = torch.sum(Ms).item()
+    A = torch.randn(M_full, K, device=device, dtype=dtype)
     B = torch.randn(bs, K, N, device=device, dtype=dtype)
 
     B_ref, B_int4, B_scales = [], [], []
@@ -123,13 +127,14 @@ def test_cutlass_w4a16_moe_mm(
     B_int4 = torch.stack(B_int4)
     B_scales = torch.stack(B_scales)
 
-    out_tensors = torch.empty(bs, M, N, device=device, dtype=dtype)
+    out_tensors = torch.empty(M_full, N, device=device, dtype=dtype)
 
     # swap AB
     problem_sizes = torch.zeros(bs, 3, device=device, dtype=torch.int32)
     problem_sizes[:, 0] = N
-    problem_sizes[:, 1] = M
     problem_sizes[:, 2] = K
+    for i in range(bs):
+        problem_sizes[i, 1] = Ms[i]
 
     # Strides for memory layout
     # A strides: [K, 1] for row-major [M, K]
@@ -144,9 +149,12 @@ def test_cutlass_w4a16_moe_mm(
     group_scale_strides = torch.zeros((bs, 2), device=device, dtype=torch.int64)
     group_scale_strides[:, 0] = N
 
-    offsets = torch.zeros(bs, device=device, dtype=torch.int64)
-    for i in range(bs):
-        offsets[i] = i * M
+    offsets = torch.cat(
+        [
+            torch.tensor([0], dtype=torch.int64),
+            torch.cumsum(Ms, dim=0)[:-1],
+        ]
+    ).to(device=device)
 
     # Call the kernel
     ops.cutlass_w4a16_moe_mm(
@@ -165,11 +173,11 @@ def test_cutlass_w4a16_moe_mm(
     )
 
     # ========reference implementation========
-    out_tensors_ref = torch.empty(bs, M, N, device=device, dtype=dtype)
+    out_tensors_ref = torch.empty(M_full, N, device=device, dtype=dtype)
+    offset = 0
     for i in range(bs):
-        out_tensors_ref[i] = A[i] @ B_ref[i]
-    is_close = torch.allclose(out_tensors, out_tensors_ref, atol=1e-3, rtol=1e-3)
-    if not is_close:
-        print(f"{out_tensors=}")
-        print(f"{out_tensors_ref=}")
+        out_tensors_ref[offset : offset + Ms[i]] = A[offset : offset + Ms[i]] @ B_ref[i]
+        offset += Ms[i]
+    # print(f"{out_tensors=}")
+    # print(f"{out_tensors_ref=}")
     torch.testing.assert_close(out_tensors, out_tensors_ref, atol=1e-3, rtol=1e-3)
