@@ -38,7 +38,8 @@ using ProblemShape =
 using MmaType = cutlass::bfloat16_t;
 using QuantType = cutlass::int4b_t;
 
-constexpr int TileShapeK = 128 * 8 / sizeof_bits<MmaType>::value;
+constexpr int TileShapeK = 32; // in order to support group size 32
+// TODO(siyuan): relax the SmemLayoutAtomScale in cutlass and make TileShapeK tunnable
 static int constexpr PackFactor = 8;  // 8 int4 packed into int32
 
 // A matrix configuration
