@@ -6,83 +6,10 @@ import pytest
 import torch
 
 from vllm import _custom_ops as ops
-from vllm.model_executor.layers.quantization.utils.quant_utils import (
-    pack_rows,
-    quantize_weights,
-)
 from vllm.platforms import current_platform
-from vllm.scalar_type import ScalarType, scalar_types
+from vllm.scalar_type import scalar_types
 
-
-def mxint4_quantize(
-    x: torch.Tensor, sf_vec_size: int = 32
-) -> tuple[torch.Tensor, torch.Tensor]:
-    x_reshaped = x.reshape(-1, sf_vec_size)
-    x_max = x_reshaped.max(dim=-1, keepdim=True)[0].to(torch.float32)
-    x_min = x_reshaped.min(dim=-1, keepdim=True)[0].to(torch.float32)
-    x_max = x_max * 8.0 / 7.0
-    amax = torch.where(x_max > -x_min, x_max, -x_min)
-    scales = amax / 8.0
-    x_scaled = x_reshaped * scales.reciprocal()
-    x_int8 = (
-        x_scaled.round().clamp(-8, 7).to(torch.int8).reshape(-1, sf_vec_size // 2, 2)
-    ) + 8
-    x_int4 = (x_int8[..., 0] & 0x0F) | ((x_int8[..., 1] & 0x0F) << 4)
-    return x_int4.reshape(*x.shape[:-1], x.shape[-1] // 2), scales.reshape(
-        -1, sf_vec_size
-    )
-
-
-def mxint4_dequantize(
-    x: torch.Tensor, scales: torch.Tensor, sf_vec_size: int = 32
-) -> torch.Tensor:
-    original_shape = x.shape
-    x = x.reshape(-1, sf_vec_size // 2)
-    scales = scales.reshape(-1, 1)
-    assert x.shape[0] == scales.shape[0]
-    x_int8 = torch.empty(
-        x.shape[0], sf_vec_size // 2, 2, dtype=torch.int8, device=x.device
-    )
-    x_int8[..., 0] = x & 0x0F
-    x_int8[..., 1] = (x >> 4) & 0x0F
-    x = x_int8.to(torch.float32)
-    x_scaled = x.reshape(-1, sf_vec_size) * scales
-
-    return x_scaled.reshape(original_shape[:-1] + (original_shape[-1] * 2,))
-
-
-def cutlass_quantize(
-    atype: torch.dtype,
-    w: torch.Tensor,
-    wtype: ScalarType,
-    stype: torch.dtype | None,
-    group_size: int | None,
-    zero_points: bool = False,
-):
-    """
-    Quantize weights into W4 and compute reference dequantized weights.
-
-    Encoding/reordering of weights and packing of scales is deferred
-    until after all experts are combined.
-    """
-    assert wtype.is_integer(), "TODO: support floating point weights"
-
-    w_ref, w_q, w_s, w_zp = quantize_weights(
-        w, wtype, group_size=group_size, zero_points=zero_points
-    )
-
-    # Since scales are later cast to fp8, recompute w_ref in atype here.
-    w_ref = (
-        w_q.to(torch.float32)
-        * w_s.to(atype).to(torch.float32).repeat_interleave(group_size, dim=0)
-    ).to(atype)
-
-    # Bit mask prevents sign extension of int4 when packing.
-    w_q = pack_rows(w_q & 0x0F, wtype.size_bits, *w_q.shape)
-    # Make weights row-major (N, K).
-    w_q = w_q.t().contiguous()
-
-    return w_ref, w_q, w_s.to(atype), w_zp
+from test_cutlass_w4a8_moe import cutlass_quantize
 
 
 @pytest.mark.skipif(current_platform.is_rocm(), reason="Skip for rocm")
@@ -100,11 +27,10 @@ def test_cutlass_w4a16_moe_mm(
     group_size: int,
     maybe_schedule: str | None,
 ):
-    alignment = 16
     torch.random.manual_seed(42)
     device = torch.device("cuda")
     dtype = torch.bfloat16
-    Ms = torch.randint(0, M // alignment, (bs,)) * alignment
+    Ms = torch.randint(0, M, (bs,))
     print(f"{Ms=}")
     M_full = torch.sum(Ms).item()
     A = torch.randn(M_full, K, device=device, dtype=dtype)
