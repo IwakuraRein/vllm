@@ -38,7 +38,7 @@ using ProblemShape =
 using MmaType = cutlass::bfloat16_t;
 using QuantType = cutlass::int4b_t;
 
-constexpr int TileShapeK = 32; // in order to support group size 32
+constexpr int TileShapeK = 64; // TODO(siyuan): make this tunable
 // TODO(siyuan): relax the SmemLayoutAtomScale in cutlass and make TileShapeK tunnable
 static int constexpr PackFactor = 8;  // 8 int4 packed into int32
 
@@ -193,6 +193,8 @@ struct W4A16GroupedGemmKernel {
                               std::nullopt, std::nullopt, b_group_scales_ptrs,
                               a_tensors, b_tensors, out_tensors, std::nullopt,
                               std::nullopt, b_group_scales, b_group_size);
+
+    cudaDeviceSynchronize();
 
     // construct args
     using Args = typename GemmShuffled::Arguments;

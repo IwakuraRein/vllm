@@ -17,29 +17,29 @@ __global__ void get_group_gemm_starts(
     int64_t* expert_offsets, ElementA** a_offsets, ElementB** b_offsets,
     ElementC** out_offsets, ElementAccumulator** a_scales_offsets,
     ElementAccumulator** b_scales_offsets,
-    ElementGroupScale** b_group_scales_offsets, ElementA* a_base_as_int,
-    ElementB* b_base_as_int, ElementC* out_base_as_int,
-    ElementAccumulator* a_scales_base_as_int,
-    ElementAccumulator* b_scales_base_as_int,
-    ElementGroupScale* b_group_scales_base_as_int, int64_t n, int64_t k,
+    ElementGroupScale** b_group_scales_offsets, ElementA* a_base,
+    ElementB* b_base_as_int, ElementC* out_base,
+    ElementAccumulator* a_scales_base,
+    ElementAccumulator* b_scales_base,
+    ElementGroupScale* b_group_scales_base, int64_t n, int64_t k,
     int64_t scale_k) {
   int expert_id = threadIdx.x;
 
   int64_t expert_offset = expert_offsets[expert_id];
 
   // same as w8a8
-  a_offsets[expert_id] = a_base_as_int + expert_offset * k;
-  out_offsets[expert_id] = out_base_as_int + expert_offset * n;
+  a_offsets[expert_id] = a_base + expert_offset * k;
+  out_offsets[expert_id] = out_base + expert_offset * n;
   if (a_scales_offsets)
-    a_scales_offsets[expert_id] = a_scales_base_as_int + expert_offset;
+    a_scales_offsets[expert_id] = a_scales_base + expert_offset;
   if (b_scales_offsets)
-    b_scales_offsets[expert_id] = b_scales_base_as_int + (n * expert_id);
+    b_scales_offsets[expert_id] = b_scales_base + (n * expert_id);
 
   // int4 specific
   constexpr int pack_factor = 8;  // pack 8 int4 into int32
   b_offsets[expert_id] = b_base_as_int + (expert_id * k * n / pack_factor);
   b_group_scales_offsets[expert_id] =
-      b_group_scales_base_as_int + (expert_id * scale_k * n);
+      b_group_scales_base + (expert_id * scale_k * n);
 }
 
 #define __CALL_GET_STARTS_KERNEL_PACKED(TENSOR_C_TYPE, C_TYPE)           \

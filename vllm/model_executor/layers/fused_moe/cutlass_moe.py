@@ -1123,6 +1123,8 @@ def run_cutlass_moe_w4a16_bf16(
     group_size: int,
 ):
     assert hidden_states.dtype == torch.bfloat16
+    assert workspace13.dtype == torch.bfloat16
+    assert workspace2.dtype == torch.bfloat16
     M = hidden_states.size(0)
     local_E = w1.size(0)
     device = hidden_states.device
@@ -1140,7 +1142,7 @@ def run_cutlass_moe_w4a16_bf16(
     if expert_map is not None:
         assert expert_num_tokens is None
     assert not use_batched_format, "batched format not supported yet"
-    # assert group_size == 128, f"Only group size 128 supported but got {group_size=}"
+    assert group_size % 64 == 0, f"Only multiple of 64 is supported but got {group_size=}"
 
     assert global_num_experts != -1
     assert w1.size(2) * 8 == K, (
@@ -1151,14 +1153,15 @@ def run_cutlass_moe_w4a16_bf16(
     a1_perm = _resize_cache(workspace2.view(dtype=torch.bfloat16), (M * topk, K))
     mm1_out = _resize_cache(workspace13, (M * topk, N * 2))
     act_out = _resize_cache(workspace2, (M * topk, N))
-    mm2_out = _resize_cache(workspace2, (M * topk, K))
+    # mm2_out = _resize_cache(workspace2, (M * topk, K))
+    mm2_out = torch.empty((M * topk, K), dtype=torch.bfloat16, device=device)
 
     problem_sizes1 = torch.empty((local_E, 3), dtype=torch.int32, device=device)
     problem_sizes2 = torch.empty((local_E, 3), dtype=torch.int32, device=device)
 
     num_expert = global_num_experts if expert_map is None else expert_map.size(0)
     # permuted a1q reuses workspace2
-    a1, _, expert_first_token_offset, inv_perm, _ = moe_permute(
+    a1_perm, _, expert_first_token_offset, inv_perm, _ = moe_permute(
         hidden_states,
         None,
         topk_ids,
@@ -1175,7 +1178,7 @@ def run_cutlass_moe_w4a16_bf16(
 
     ops.cutlass_w4a16_moe_mm(
         mm1_out,
-        a1,
+        a1_perm,
         w1,
         w1_scale,
         group_size,
@@ -1275,7 +1278,7 @@ class CutlassExpertsW4A16Bf16(mk.FusedMoEPermuteExpertsUnpermute):
         activation: str,
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
         activation_out_dim = self.adjust_N_for_activation(N, activation)
-        workspace1 = (M * topk, max(N, K))
+        workspace1 = (M * topk, max(activation_out_dim, K))
         workspace2 = (M * topk, max(activation_out_dim, K))
         output = (M, K)
         return (workspace1, workspace2, output)

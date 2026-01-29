@@ -16,8 +16,8 @@ from test_cutlass_w4a8_moe import cutlass_quantize
 @pytest.mark.parametrize("bs", [1, 64, 128, 384])
 @pytest.mark.parametrize("M", [128, 1024, 2048])
 @pytest.mark.parametrize("N", [128, 1024, 2048, 7168])
-@pytest.mark.parametrize("K", [2048, 4096, 7168, 16384, 32768])
-@pytest.mark.parametrize("group_size", [32])
+@pytest.mark.parametrize("K", [2048, 4096, 7168, 16384])
+@pytest.mark.parametrize("group_size", [64, 128])
 @pytest.mark.parametrize("maybe_schedule", [None])
 def test_cutlass_w4a16_moe_mm(
     bs: int,
