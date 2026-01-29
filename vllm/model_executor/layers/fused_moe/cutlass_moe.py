@@ -1150,11 +1150,12 @@ def run_cutlass_moe_w4a16_bf16(
     )
 
     topk = topk_ids.size(1)
-    a1_perm = _resize_cache(workspace2.view(dtype=torch.bfloat16), (M * topk, K))
-    mm1_out = _resize_cache(workspace13, (M * topk, N * 2))
-    act_out = _resize_cache(workspace2, (M * topk, N))
-    # mm2_out = _resize_cache(workspace2, (M * topk, K))
-    mm2_out = torch.empty((M * topk, K), dtype=torch.bfloat16, device=device)
+    a1_perm = _resize_cache(workspace13, (M * topk, K))
+    mm1_out = _resize_cache(workspace2, (M * topk, N * 2))
+    act_out = _resize_cache(workspace13, (M * topk, N))
+    # for non-chunking mode the output is resized from workspace13
+    # so we need to make sure mm2_out uses workspace2.
+    mm2_out = _resize_cache(workspace2, (M * topk, K))
 
     problem_sizes1 = torch.empty((local_E, 3), dtype=torch.int32, device=device)
     problem_sizes2 = torch.empty((local_E, 3), dtype=torch.int32, device=device)
@@ -1206,8 +1207,6 @@ def run_cutlass_moe_w4a16_bf16(
         s_strides2,
     )
 
-    # for non-chunking mode the output is resized from workspace13
-    # so we need to make sure mm2_out uses workspace2.
     moe_unpermute(
         out=output,
         permuted_hidden_states=mm2_out,
