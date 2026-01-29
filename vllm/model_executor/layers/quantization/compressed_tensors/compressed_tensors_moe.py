@@ -176,7 +176,7 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
             # Prefer to use the CutlassMoE kernel when it is supported.
             if (
                 weight_quant.num_bits == 4 and 
-                group_size % 32 == 0 and
+                group_size % 64 == 0 and
                 current_platform.is_cuda()
             ):
                 logger.info_once("Using CompressedTensorsW4A16CutlassMoEMethod")
@@ -2684,13 +2684,13 @@ class CompressedTensorsW4A16CutlassMoEMethod(CompressedTensorsMoEMethod):
 
         self.group_size = self.weight_quant.group_size
         self.num_bits = self.weight_quant.num_bits
-        self.packed_factor = 32 // self.num_bits
+        self.packed_factor = 32 // self.num_bits # use int32 to pack int4
 
         assert self.weight_quant.symmetric, (
-            "Only symmetric quantization is supported for W4A8 MoE"
+            "Only symmetric quantization is supported for W4A16 MoE"
         )
         assert self.weight_quant.actorder != "group"
-        assert self.group_size % 32 == 0, "Only multiple of 32 is supported for W4A16 Cutlass MoE's scale group size"
+        assert self.group_size % 64 == 0, "Only multiple of 64 is supported for W4A16 Cutlass MoE's scale group size"
 
         self.disable_expert_map = False
         self.layer_name = layer_name
@@ -2744,9 +2744,6 @@ class CompressedTensorsW4A16CutlassMoEMethod(CompressedTensorsMoEMethod):
         set_weight_attrs(w2_weight_packed, extra_weight_attrs)
 
         # SCALES
-        # weight_scale refers to the group-wise scales
-        # they are initially loaded as bf16, we will convert to fp8
-        # after loading
         w13_weight_scale = torch.nn.Parameter(
             torch.ones(
                 num_experts,
@@ -2793,6 +2790,12 @@ class CompressedTensorsW4A16CutlassMoEMethod(CompressedTensorsMoEMethod):
 
     def process_weights_after_loading(self, layer):
         device = layer.w13_weight_packed.device
+
+        # Transpose the scales
+        w13_weight_scale = layer.w13_weight_scale.transpose(1, 2).contiguous()
+        w2_weight_scale = layer.w2_weight_scale.transpose(1, 2).contiguous()
+        replace_parameter(layer, "w13_weight_scale", w13_weight_scale)
+        replace_parameter(layer, "w2_weight_scale", w2_weight_scale)
 
         # STRIDES
         # A, C
@@ -2902,7 +2905,7 @@ class CompressedTensorsW4A16CutlassMoEMethod(CompressedTensorsMoEMethod):
     ):
         if layer.enable_eplb:
             raise NotImplementedError(
-                "EPLB not supported for `CompressedTensorsW4A8Fp8MoEMethod` yet."
+                "EPLB not supported for `CompressedTensorsW4A16CutlassMoEMethod` yet."
             )
         assert self.moe_quant_config is not None
         topk_weights, topk_ids = router.select_experts(
