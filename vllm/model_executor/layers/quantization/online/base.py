@@ -56,6 +56,9 @@ from vllm.model_executor.layers.quantization.online.mxfp8 import (
 from vllm.model_executor.layers.quantization.online.nvfp4 import (
     Nvfp4OnlineMoEMethod,
 )
+from vllm.model_executor.layers.quantization.online.nvfp4_linear import (
+    Nvfp4OnlineLinearMethod,
+)
 from vllm.model_executor.layers.quantization.utils.config_utils import (
     find_matching_patterns,
     get_layer_name_after_index,
@@ -91,6 +94,7 @@ _ONLINE_LINEAR_METHODS: dict[QuantKey, type] = {
     kFp8StaticChannelSym: Fp8PtpcOnlineLinearMethod,
     kMxfp8Dynamic: Mxfp8OnlineLinearMethod,
     kMxfp4Static: Mxfp4OnlineLinearMethod,
+    kNvfp4Static: Nvfp4OnlineLinearMethod,
 }
 
 _ONLINE_MOE_METHODS: dict[QuantKey, type] = {
@@ -237,10 +241,14 @@ class OnlineQuantizationConfig(QuantizationConfig):
                 f"weight={spec.weight} is not supported; supported weight "
                 f"keys: {sorted(str(k) for k in table)}"
             )
-        # Online method classes pick their own activation format internally.
-        # Per-class activation overrides are not yet wired through; reject
-        # explicit overrides until the relevant method class opts in.
-        if spec.activation is not None:
+        supported_activations = getattr(cls, "supported_activation_quant", None)
+        if supported_activations is not None:
+            if spec.activation not in supported_activations:
+                raise ValueError(
+                    f"activation={spec.activation} is not supported for "
+                    f"online {cls.__name__}"
+                )
+        elif spec.activation is not None:
             raise ValueError(
                 f"activation override (activation={spec.activation}) is not "
                 f"yet supported for online {cls.__name__}"
@@ -373,7 +381,7 @@ class OnlineQuantizationConfig(QuantizationConfig):
         # `targets` takes precedence over `moe` and `linear` and is exclusive.
         resolved = self.resolve_quant_method_cls(layer, prefix)
         if resolved is not None:
-            source, quant_key_str, target_pattern, _, quant_method_cls = resolved
+            source, quant_key_str, target_pattern, spec, quant_method_cls = resolved
             self.quantized_layers[prefix] = (
                 source.value,
                 quant_key_str,
@@ -381,6 +389,10 @@ class OnlineQuantizationConfig(QuantizationConfig):
             )
             if isinstance(layer, RoutedExperts):
                 assert issubclass(quant_method_cls, FusedMoEMethodBase)
+                if quant_method_cls is Nvfp4OnlineMoEMethod:
+                    return quant_method_cls(
+                        moe=layer.moe_config, activation_key=spec.activation
+                    )
                 return quant_method_cls(moe=layer.moe_config)
 
             assert issubclass(quant_method_cls, OnlineLinearBase)

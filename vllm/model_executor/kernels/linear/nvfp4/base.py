@@ -18,7 +18,7 @@ class NvFp4LinearLayerConfig:
     scales for both weights and activations.
     """
 
-    pass
+    input_dtype: torch.dtype | None = None
 
 
 class NvFp4LinearKernel(ABC):

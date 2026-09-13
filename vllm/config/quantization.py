@@ -26,6 +26,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kMxfp4Dynamic,
     kMxfp4Static,
     kMxfp8Dynamic,
+    kNvfp4Dynamic,
     kNvfp4Static,
 )
 
@@ -40,6 +41,8 @@ QUANT_KEY_NAMES: dict[str, QuantKey] = {
     "mxfp8": kMxfp8Dynamic,
     "mxfp4": kMxfp4Dynamic,
     "int8_per_channel_static": kInt8StaticChannelSym,
+    "nvfp4": kNvfp4Static,
+    "nvfp4_per_token_dynamic": kNvfp4Dynamic,
 }
 
 
@@ -214,6 +217,10 @@ _ONLINE_SHORTHANDS: dict[str, QuantizationConfigArgs] = {
     # Online NVFP4 on MoE with per-token dynamic activation scales (Blackwell +
     # FlashInfer TRTLLM only); linear stays unquantized (no `linear` field).
     "nvfp4_per_token": QuantizationConfigArgs(
+        moe=QuantSpec(weight=kNvfp4Static, activation=kNvfp4Dynamic),
+    ),
+    "nvfp4_weight_only": QuantizationConfigArgs(
+        linear=QuantSpec(weight=kNvfp4Static),
         moe=QuantSpec(weight=kNvfp4Static),
     ),
 }

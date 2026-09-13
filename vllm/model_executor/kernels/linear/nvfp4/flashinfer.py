@@ -56,6 +56,8 @@ class FlashInferCuteDslNvFp4W4A16LinearKernel(NvFp4LinearKernel):
 
     @classmethod
     def can_implement(cls, config: NvFp4LinearLayerConfig) -> tuple[bool, str | None]:
+        if config.input_dtype not in (None, torch.bfloat16):
+            return False, "FlashInfer CuTe-DSL W4A16 requires BF16 input"
         return True, None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:

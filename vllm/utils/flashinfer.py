@@ -502,6 +502,22 @@ def has_flashinfer_cutedsl_moe_nvfp4() -> bool:
 
 
 @functools.cache
+def has_flashinfer_cutedsl_moe_nvfp4_w4a16() -> bool:
+    """Return whether FlashInfer's CuTe DSL MoE API supports W4A16."""
+    if not has_flashinfer_cutedsl_moe_nvfp4():
+        return False
+    import inspect
+
+    mod = _get_submodule("flashinfer")
+    assert mod is not None
+    try:
+        params = inspect.signature(mod.cute_dsl_fused_moe_nvfp4).parameters
+    except (TypeError, ValueError):
+        return False
+    return "quant_mode" in params
+
+
+@functools.cache
 def has_flashinfer_b12x_gemm() -> bool:
     """Return True if FlashInfer b12x FP4 GEMM backend is available (SM120+)."""
     if not has_flashinfer_cutedsl():
@@ -1269,6 +1285,7 @@ __all__ = [
     "has_flashinfer_recurrent_kda",
     "has_flashinfer_fused_kda_decode",
     "has_flashinfer_cutedsl_moe_nvfp4",
+    "has_flashinfer_cutedsl_moe_nvfp4_w4a16",
     "has_flashinfer_bf16_fp4",
     "has_flashinfer_b12x_moe",
     "has_flashinfer_b12x_gemm",

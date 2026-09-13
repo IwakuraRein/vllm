@@ -12,6 +12,8 @@ import pytest
 import torch
 from torch.distributed import ProcessGroup
 
+from tests.kernels.quantization.nvfp4_utils import dequantize_nvfp4_to_dtype
+from tests.kernels.utils import torch_moe
 from tests.quantization.utils import (
     _test_online_quant_peak_mem_impl,
     is_quant_method_supported,
@@ -24,6 +26,7 @@ from vllm.config.load import LoadConfig
 from vllm.config.model import ModelConfig
 from vllm.config.quantization import (
     QuantizationConfigArgs,
+    QuantSpec,
     resolve_quantization_config,
 )
 from vllm.config.vllm import VllmConfig
@@ -35,7 +38,11 @@ from vllm.model_executor.kernels.linear.mxfp8.marlin import (
     MarlinMxfp8LinearKernel,
 )
 from vllm.model_executor.layers.attention import Attention
-from vllm.model_executor.layers.fused_moe import FusedMoEFactory
+from vllm.model_executor.layers.fused_moe import (
+    FusedMoEFactory,
+    RoutedExperts,
+    fused_topk,
+)
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     LinearBase,
@@ -80,6 +87,9 @@ from vllm.model_executor.layers.quantization.online.nvfp4 import (
     Nvfp4OnlineMoEMethod,
     _quantize_moe_weight_to_nvfp4,
 )
+from vllm.model_executor.layers.quantization.online.nvfp4_linear import (
+    Nvfp4OnlineLinearMethod,
+)
 from vllm.model_executor.layers.quantization.quark.quark import (
     QuarkConfig,
     QuarkLinearMethod,
@@ -92,6 +102,8 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     amax_for_moe_weight_quant,
     amax_for_tp_weight_quant,
     kMxfp8Dynamic,
+    kNvfp4Dynamic,
+    kNvfp4Static,
     weight_amax,
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -103,8 +115,13 @@ from vllm.model_executor.model_loader.dummy_loader import DummyModelLoader
 from vllm.model_executor.models.granitemoe import (
     GraniteMoeModel,
 )
+from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
-from vllm.utils.flashinfer import has_flashinfer_trtllm_fused_moe
+from vllm.utils.flashinfer import (
+    has_flashinfer_bf16_fp4,
+    has_flashinfer_cutedsl_moe_nvfp4_w4a16,
+    has_flashinfer_trtllm_fused_moe,
+)
 
 if current_platform.is_rocm():
     from vllm.platforms.rocm import on_gfx942, on_gfx950
@@ -124,8 +141,10 @@ PARTIALLY_PREQUANTIZED_MODEL_NAME = (
 )
 
 
+@pytest.mark.parametrize("activation_key", [None, kNvfp4Dynamic])
 def test_online_nvfp4_reuses_kernel_when_weights_are_reprocessed(
     monkeypatch,
+    activation_key,
 ) -> None:
     method = object.__new__(Nvfp4OnlineMoEMethod)
     method.moe = SimpleNamespace(is_act_and_mul=True)
@@ -133,6 +152,7 @@ def test_online_nvfp4_reuses_kernel_when_weights_are_reprocessed(
     method.experts_cls = object
     method.moe_quant_config = None
     method.moe_kernel = None
+    method.activation_key = activation_key
 
     layer = Mock()
     converted_weights = tuple(object() for _ in range(8))
@@ -167,8 +187,35 @@ def test_online_nvfp4_reuses_kernel_when_weights_are_reprocessed(
     assert method.moe_kernel is kernel
     assert convert_weights.call_count == 2
     make_kernel.assert_called_once()
+    assert make_kernel.call_args.kwargs["per_token_activation"] == (
+        activation_key == kNvfp4Dynamic
+    )
     get_quant_config.assert_called_once()
     assert process_weights.call_count == 2
+
+
+@pytest.mark.parametrize(
+    "layer_kind,activation_key",
+    [("linear", kMxfp8Dynamic), ("linear", kNvfp4Dynamic), ("moe", kMxfp8Dynamic)],
+)
+def test_online_nvfp4_rejects_unsupported_activation(
+    layer_kind: str, activation_key
+) -> None:
+    """An activation override must not silently select a different precision."""
+    config = OnlineQuantizationConfig(
+        QuantizationConfigArgs(
+            **{layer_kind: QuantSpec(weight=kNvfp4Static, activation=activation_key)}
+        )
+    )
+    layer = Mock(spec=LinearBase if layer_kind == "linear" else RoutedExperts)
+    with pytest.raises(ValueError, match="activation"):
+        config.resolve_quant_method_cls(layer, "layer")
+
+
+def test_online_nvfp4_weight_only_rejects_moe_bias() -> None:
+    """Reject unsupported expert bias instead of silently dropping it."""
+    with pytest.raises(ValueError, match="does not support MoE biases"):
+        Nvfp4OnlineMoEMethod(moe=SimpleNamespace(has_bias=True), activation_key=None)
 
 
 def _fully_quantized_quark_config() -> QuarkConfig:
@@ -1205,6 +1252,165 @@ def test_online_nvfp4_quantizes_original_expert_weights() -> None:
         block_scale,
         torch.stack([expert_scale for _, expert_scale in expected]),
     )
+
+
+@pytest.mark.skipif(
+    not (
+        current_platform.is_cuda()
+        and (
+            current_platform.is_device_capability_family(100)
+            or current_platform.is_device_capability_family(120)
+        )
+    ),
+    reason="Online NVFP4 weight quantization needs a Blackwell GPU.",
+)
+@pytest.mark.parametrize(
+    "linear_backend,dtype",
+    [
+        ("marlin", torch.float16),
+        ("marlin", torch.bfloat16),
+        ("flashinfer_cutedsl", torch.bfloat16),
+        ("auto", torch.float16),
+    ],
+)
+@torch.inference_mode()
+def test_online_nvfp4_weight_only_linear(
+    linear_backend: str, dtype: torch.dtype, default_vllm_config, dist_init
+) -> None:
+    """Online NVFP4 matmul preserves A16 and matches dequantized weights."""
+    if linear_backend == "flashinfer_cutedsl" and not has_flashinfer_bf16_fp4():
+        pytest.skip("FlashInfer CuTe-DSL BF16 x FP4 GEMM is unavailable.")
+
+    torch.manual_seed(0)
+    default_vllm_config.model_config = ModelConfig(dtype=dtype)
+    default_vllm_config.kernel_config.linear_backend = linear_backend
+    config = OnlineQuantizationConfig(
+        resolve_quantization_config("nvfp4_weight_only", None)
+    )
+    with torch.device("cuda"):
+        layer = ColumnParallelLinear(
+            input_size=256,
+            output_size=128,
+            params_dtype=dtype,
+            quant_config=config,
+            disable_tp=True,
+            return_bias=False,
+        )
+        weight = torch.randn(128, 256, dtype=dtype) / 16
+        weight[:16] = 0
+        replace_parameter(layer, "weight", weight)
+        layer.bias.data.uniform_(-0.1, 0.1)
+        reference_bias = layer.bias.detach().clone()
+
+        packed, scales, global_scale = _quantize_moe_weight_to_nvfp4(
+            weight.unsqueeze(0)
+        )
+        reference_weight = dequantize_nvfp4_to_dtype(
+            packed[0],
+            scales[0],
+            1 / global_scale[0],
+            dtype=dtype,
+            device=weight.device,
+            is_sf_linear_layout=True,
+        )
+        assert isinstance(layer.quant_method, Nvfp4OnlineLinearMethod)
+        layer.quant_method.process_weights_after_loading(layer)
+        layer.quant_method.process_weights_after_loading(layer)
+
+        for num_tokens in (1, 17):
+            x = torch.randn(num_tokens, 256, dtype=dtype)
+            expected = torch.nn.functional.linear(x, reference_weight, reference_bias)
+            actual = layer(x)
+            assert actual.dtype == dtype
+            torch.testing.assert_close(actual, expected, atol=0.015, rtol=0.015)
+            if num_tokens == 1:
+                torch.accelerator.synchronize()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    graph_output = layer(x)
+                x.mul_(0.5)
+                graph.replay()
+                expected = torch.nn.functional.linear(
+                    x, reference_weight, reference_bias
+                )
+                torch.testing.assert_close(
+                    graph_output, expected, atol=0.015, rtol=0.015
+                )
+
+
+@pytest.mark.skipif(
+    not (
+        current_platform.is_cuda()
+        and (
+            current_platform.is_device_capability_family(100)
+            or current_platform.is_device_capability_family(120)
+        )
+    ),
+    reason="Online NVFP4 weight quantization needs a Blackwell GPU.",
+)
+@pytest.mark.parametrize("moe_backend", ["marlin", "flashinfer_cutedsl"])
+@torch.inference_mode()
+def test_online_nvfp4_weight_only_moe(
+    moe_backend: str, default_vllm_config, dist_init, workspace_init
+) -> None:
+    """Both MoE GEMMs use A16 after online quantization and kernel conversion."""
+    if moe_backend == "flashinfer_cutedsl" and not (
+        has_flashinfer_cutedsl_moe_nvfp4_w4a16()
+        and current_platform.is_device_capability_family(100)
+    ):
+        pytest.skip("FlashInfer CuTe-DSL NVFP4 MoE is unavailable.")
+
+    torch.manual_seed(0)
+    dtype = torch.bfloat16
+    default_vllm_config.model_config = ModelConfig(dtype=dtype)
+    default_vllm_config.kernel_config.moe_backend = moe_backend
+    config = OnlineQuantizationConfig(
+        resolve_quantization_config("nvfp4_weight_only", None)
+    )
+    with torch.device("cuda"):
+        runner = FusedMoEFactory(
+            num_experts=4,
+            top_k=2,
+            hidden_size=512,
+            intermediate_size=128,
+            params_dtype=dtype,
+            quant_config=config,
+            renormalize=False,
+        )
+        layer = runner.routed_experts
+        reference_weights = []
+        for name in ("w13_weight", "w2_weight"):
+            weight = torch.randn_like(getattr(layer, name), device="cuda") / 16
+            packed, scales, global_scale = _quantize_moe_weight_to_nvfp4(weight)
+            reference_weights.append(
+                torch.stack(
+                    [
+                        dequantize_nvfp4_to_dtype(
+                            packed[expert],
+                            scales[expert],
+                            1 / global_scale[expert],
+                            dtype=dtype,
+                            device=weight.device,
+                            is_sf_linear_layout=True,
+                        )
+                        for expert in range(4)
+                    ]
+                )
+            )
+            replace_parameter(layer, name, weight)
+
+        method = layer.quant_method
+        assert isinstance(method, Nvfp4OnlineMoEMethod)
+        method.process_weights_after_loading(layer)
+        assert method.moe_quant_config.quant_dtype is None
+
+        for num_tokens in (1, 17):
+            x = torch.randn(num_tokens, 512, dtype=dtype) / 10
+            score = torch.randn(num_tokens, 4, dtype=dtype)
+            topk_weights, topk_ids, _ = fused_topk(x, score, 2, renormalize=False)
+            expected = torch_moe(x, *reference_weights, score, topk=2)
+            actual = method.apply(layer, x, topk_weights, topk_ids, None, None)
+            torch.testing.assert_close(actual, expected, atol=0.001, rtol=0.02)
 
 
 @pytest.mark.skipif(

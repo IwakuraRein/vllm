@@ -23,6 +23,7 @@ from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import 
     FLOAT4_E2M1_MAX,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    QuantKey,
     amax_for_moe_weight_quant,
     kNvfp4Dynamic,
     kNvfp4Static,
@@ -80,33 +81,58 @@ def _quantize_moe_weight_to_nvfp4(
 
 
 class Nvfp4OnlineMoEMethod(OnlineMoEMethodBase):
-    """Online NVFP4 MoE quantization with per-token activation scales.
+    """Online NVFP4 MoE with per-token FP4 or unquantized activations.
 
-    Quantizes fp16/bf16 expert weights to NVFP4 at load time; the FlashInfer
-    TRTLLM kernel computes per-token activation scales at runtime. Blackwell
-    (SM100) only.
+    Quantizes fp16/bf16 expert weights to NVFP4 at load time; when
+    using the per-token quantization, the FlashInfer TRTLLM kernel
+    computes per-token activation scales at runtime.
+
+    Per-token quantization is Blackwell (SM100) only.
     """
+
+    supported_activation_quant = {None, kNvfp4Dynamic}
 
     def __init__(
         self,
         *,
         moe: FusedMoEConfig,
+        activation_key: QuantKey | None = kNvfp4Dynamic,
     ):
-        if not current_platform.is_device_capability_family(100):
+        if activation_key not in self.supported_activation_quant:
+            raise ValueError(f"Unsupported online NVFP4 activation: {activation_key}")
+        self.activation_key = activation_key
+        if activation_key is None and moe.has_bias:
+            raise ValueError("Online NVFP4 W4A16 does not support MoE biases.")
+        if (
+            activation_key is not None
+            and not current_platform.is_device_capability_family(100)
+        ):
             raise ValueError(
                 "nvfp4_per_token online quantization requires a Blackwell (SM100) GPU."
+            )
+        if activation_key is None and not (
+            current_platform.is_cuda()
+            and (
+                current_platform.is_device_capability_family(100)
+                or current_platform.is_device_capability_family(120)
+            )
+        ):
+            raise ValueError(
+                "Online NVFP4 weight quantization requires a Blackwell GPU "
+                "(SM100, SM103, SM120, or SM121)."
             )
         super().__init__(moe)
         self.nvfp4_backend, self.experts_cls = select_nvfp4_moe_backend(
             config=self.moe,
             weight_key=kNvfp4Static,
-            activation_key=kNvfp4Dynamic,
+            activation_key=activation_key,
         )
 
     def process_weights_after_loading(self, layer: Module) -> None:
         if getattr(layer, "_already_called_process_weights_after_loading", False):
             return
 
+        self._zero_padding(layer)
         self._quantize_weights(layer)
         self._setup_kernel(layer)
 
@@ -127,6 +153,11 @@ class Nvfp4OnlineMoEMethod(OnlineMoEMethodBase):
         replace_parameter(layer, "w2_weight", w2)
         replace_parameter(layer, "w2_weight_scale", w2_scale)
         replace_parameter(layer, "w2_weight_scale_2", w2_scale_2)
+
+        if self.activation_key is None:
+            layer.w13_input_scale = None
+            layer.w2_input_scale = None
+            return
 
         # Neutral (1.0) activation global scales: the kernel derives per-token
         # scales at runtime, so the output scalars reduce to the weight scales.
@@ -156,6 +187,7 @@ class Nvfp4OnlineMoEMethod(OnlineMoEMethodBase):
             w2_scale_2=layer.w2_weight_scale_2,
             a2_scale=layer.w2_input_scale,
             is_act_and_mul=self.moe.is_act_and_mul,
+            use_a16=self.activation_key is None,
         )
 
         replace_parameter(layer, "w13_weight", w13)
@@ -176,7 +208,7 @@ class Nvfp4OnlineMoEMethod(OnlineMoEMethodBase):
                 experts_cls=self.experts_cls,
                 backend=self.nvfp4_backend,
                 routing_tables=layer._expert_routing_tables(),
-                per_token_activation=True,
+                per_token_activation=self.activation_key is not None,
             )
 
         self.moe_kernel.fused_experts.process_weights_after_loading(layer)
@@ -191,5 +223,8 @@ class Nvfp4OnlineMoEMethod(OnlineMoEMethodBase):
             a13_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
             swiglu_limit=getattr(layer, "swiglu_limit", None),
+            swiglu_alpha=getattr(layer, "swiglu_alpha", None),
+            swiglu_beta=getattr(layer, "swiglu_beta", None),
             layer=layer,
+            use_a16=self.activation_key is None,
         )

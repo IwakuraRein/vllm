@@ -1034,10 +1034,12 @@ def init_wfp8_a16_linear_kernel(
     )
 
 
-def init_nvfp4_linear_kernel(use_a16: bool = False) -> NvFp4LinearKernel:
+def init_nvfp4_linear_kernel(
+    use_a16: bool = False, input_dtype: torch.dtype | None = None
+) -> NvFp4LinearKernel:
     """Select and instantiate the best NVFP4 linear kernel for the
     current platform."""
-    config = NvFp4LinearLayerConfig()
+    config = NvFp4LinearLayerConfig(input_dtype=input_dtype)
     a16_kernels = (
         FlashInferCuteDslNvFp4W4A16LinearKernel,
         MarlinNvFp4LinearKernel,
@@ -1086,7 +1088,10 @@ def init_nvfp4_linear_kernel(use_a16: bool = False) -> NvFp4LinearKernel:
         cutedsl_ok, _ = FlashInferCuteDslNvFp4W4A16LinearKernel.is_supported(
             compute_capability
         )
-        if compute_capability in (100, 103) and cutedsl_ok:
+        cutedsl_dtype_ok, _ = FlashInferCuteDslNvFp4W4A16LinearKernel.can_implement(
+            config
+        )
+        if compute_capability in (100, 103) and cutedsl_ok and cutedsl_dtype_ok:
             force_kernel = FlashInferCuteDslNvFp4W4A16LinearKernel
         else:
             force_kernel = MarlinNvFp4LinearKernel

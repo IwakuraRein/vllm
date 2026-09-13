@@ -24,6 +24,8 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8StaticTensorSym,
     kInt8StaticChannelSym,
     kMxfp8Dynamic,
+    kNvfp4Dynamic,
+    kNvfp4Static,
 )
 
 # ---- QuantSpec ------------------------------------------------------------
@@ -107,6 +109,24 @@ def test_resolve_int8_shorthand_leaves_linear_unset():
     args = resolve_quantization_config("int8_per_channel_weight_only", None)
     assert args.linear is None
     assert args.moe == QuantSpec(weight=kInt8StaticChannelSym)
+
+
+@pytest.mark.parametrize("shorthand", ["nvfp4_weight_only", "nvfp4_per_token"])
+def test_resolve_nvfp4_shorthand_preserves_activation_format(shorthand: str):
+    """Weight-only applies to dense/MoE; per-token keeps dynamic A4 MoE only."""
+    args = resolve_quantization_config(shorthand, None)
+    if shorthand == "nvfp4_weight_only":
+        assert args.linear == args.moe == QuantSpec(weight=kNvfp4Static)
+    else:
+        assert args.linear is None
+        assert args.moe == QuantSpec(weight=kNvfp4Static, activation=kNvfp4Dynamic)
+
+
+@pytest.mark.parametrize("layer_kind", ["linear", "moe"])
+def test_nvfp4_explicit_weight_only_spec_matches_shorthand(layer_kind: str):
+    args = QuantizationConfigArgs(**{layer_kind: {"weight": "nvfp4"}})
+    expected = resolve_quantization_config("nvfp4_weight_only", None)
+    assert getattr(args, layer_kind) == getattr(expected, layer_kind)
 
 
 def test_resolve_quantization_config_only():

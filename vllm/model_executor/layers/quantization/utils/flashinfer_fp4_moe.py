@@ -111,20 +111,20 @@ def prepare_nvfp4_moe_layer_for_flashinfer_cutedsl(
     w13: torch.Tensor,
     w13_scale: torch.Tensor,
     w13_scale_2: torch.Tensor,
-    a13_scale: torch.Tensor,
+    a13_scale: torch.Tensor | None,
     w2: torch.Tensor,
     w2_scale: torch.Tensor,
     w2_scale_2: torch.Tensor,
-    a2_scale: torch.Tensor,
+    a2_scale: torch.Tensor | None,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
+    torch.Tensor | None,
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
+    torch.Tensor | None,
 ]:
     """Prepare weights for the CuteDSL wrapper-based NvFP4 MoE backend.
 
@@ -135,10 +135,14 @@ def prepare_nvfp4_moe_layer_for_flashinfer_cutedsl(
     # Global scaling factors (same as other FlashInfer backends).
     num_experts = w13.shape[0]
     enable_eplb = layer.moe_config.moe_parallel_config.enable_eplb
-    a13_scale = amax_for_moe_activation_quant(a13_scale, enable_eplb).repeat(
-        num_experts
-    )
-    a2_scale = amax_for_moe_activation_quant(a2_scale, enable_eplb).repeat(num_experts)
+    if a13_scale is not None:
+        a13_scale = amax_for_moe_activation_quant(a13_scale, enable_eplb).repeat(
+            num_experts
+        )
+    if a2_scale is not None:
+        a2_scale = amax_for_moe_activation_quant(a2_scale, enable_eplb).repeat(
+            num_experts
+        )
 
     if layer.activation.is_gated:
         w13, w13_scale = reorder_w13_to_w31_for_flashinfer_cutedsl(

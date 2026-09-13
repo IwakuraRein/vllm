@@ -25,6 +25,7 @@ from vllm.platforms import current_platform
 from vllm.utils.flashinfer import (
     flashinfer_cute_dsl_fused_moe_nvfp4,
     has_flashinfer_cutedsl_moe_nvfp4,
+    has_flashinfer_cutedsl_moe_nvfp4_w4a16,
 )
 
 
@@ -46,9 +47,9 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
             moe_config=moe_config,
             quant_config=quant_config,
         )
-        assert quant_config.quant_dtype == "nvfp4", (
-            "Only nvfp4 quantization is currently supported."
-        )
+        assert quant_config.weight_quant_dtype == "nvfp4"
+        assert quant_config.quant_dtype in ("nvfp4", None)
+        self.use_a16 = quant_config.quant_dtype is None
         self.out_dtype = moe_config.in_dtype
         self.hidden_dim = moe_config.hidden_dim
         self.intermediate_size_per_partition = (
@@ -66,8 +67,32 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
         self.situ_linear_beta = moe_config.activation_situ_linear_beta
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if self.use_a16:
+            return
         layer.w13_weight_scale_2.data.mul_(layer.w13_input_scale)
         layer.w2_weight_scale_2.data.mul_(layer.w2_input_scale)
+
+    @staticmethod
+    def is_supported_config(
+        cls: type[mk.FusedMoEExperts],
+        moe_config: FusedMoEConfig,
+        weight_key: QuantKey | None,
+        activation_key: QuantKey | None,
+        activation_format: mk.FusedMoEActivationFormat,
+    ) -> tuple[bool, str | None]:
+        supported, reason = mk.FusedMoEExperts.is_supported_config(
+            cls, moe_config, weight_key, activation_key, activation_format
+        )
+        if not supported or activation_key is not None:
+            return supported, reason
+        if moe_config.in_dtype != torch.bfloat16:
+            return False, "FlashInfer CuTe DSL NVFP4 W4A16 requires BF16 activations"
+        if not has_flashinfer_cutedsl_moe_nvfp4_w4a16():
+            return False, (
+                "FlashInfer CuTe DSL NVFP4 W4A16 requires a FlashInfer version "
+                "with quant_mode support"
+            )
+        return True, None
 
     @staticmethod
     def activation_format() -> mk.FusedMoEActivationFormat:
@@ -93,6 +118,7 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
     ) -> bool:
         SUPPORTED_W_A = [
             (kNvfp4Static, kNvfp4Dynamic),
+            (kNvfp4Static, None),
         ]
         return (weight_key, activation_key) in SUPPORTED_W_A
 
@@ -128,8 +154,7 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
         workspace1 = (0,)
         workspace2 = (0,)
-        # K is packed (K//2 for uint8), so output uses hidden_dim.
-        assert self.hidden_dim == K * 2
+        assert self.hidden_dim == (K if self.use_a16 else K * 2)
         output = (M, self.hidden_dim)
         return (workspace1, workspace2, output)
 
@@ -151,14 +176,19 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool | None,
     ):
-        assert self.quant_dtype == "nvfp4"
-        assert a1q_scale is not None
         assert self.w1_scale is not None
         assert self.w2_scale is not None
 
-        # a1q_scale is (M, K//16) float8_e4m3fn from fp4_quantize.
-        # The functional API expects x_sf with trailing dim: (M, K//16, 1).
-        x_sf = a1q_scale.unsqueeze(-1)
+        quant_kwargs: dict[str, str] = {}
+        if self.use_a16:
+            assert hidden_states.dtype == torch.bfloat16
+            assert a1q_scale is None
+            x_sf = None
+            quant_kwargs["quant_mode"] = "w4a16"
+        else:
+            assert a1q_scale is not None
+            # The functional API expects x_sf as (M, K//16, 1).
+            x_sf = a1q_scale.unsqueeze(-1)
 
         # The kernel defaults swiglu_{alpha,beta,limit} to the plain-SwiGLU
         # values, so only forward the ones the model actually sets.
@@ -197,7 +227,7 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
             w1_weight=w1,
             w1_weight_sf=self.w1_scale,
             w1_alpha=self.g1_alphas,
-            fc2_input_scale=self.a2_gscale,
+            fc2_input_scale=None if self.use_a16 else self.a2_gscale,
             w2_weight=w2,
             w2_weight_sf=self.w2_scale,
             w2_alpha=self.g2_alphas,
@@ -210,4 +240,5 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
                 MoEActivation.SILU if activation == MoEActivation.SITU else activation
             ),
             **swiglu_kwargs,
+            **quant_kwargs,
         )
