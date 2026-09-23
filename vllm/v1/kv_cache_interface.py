@@ -914,6 +914,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
     alignment: int | None = None  # Default to None for no padding.
     model_version: str | None = None
     bounded_replay: bool = False
+    non_causal_multi_token_decode: bool = False
 
     # MLA stores a single latent vector per state; there is no separate V.
     head_size_v: int = 0
@@ -971,6 +972,9 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             tokens_per_state=tokens_per_state_set.pop(),
             model_version=model_version_set.pop(),
             bounded_replay=bounded_replay_set.pop(),
+            non_causal_multi_token_decode=any(
+                spec.non_causal_multi_token_decode for spec in specs
+            ),
         )
 
     def is_uniform_with_collection(

@@ -308,25 +308,38 @@ class DFlashQwen3DecoderLayer(nn.Module):
         # distilled the other way has to say so here.
         is_neox_style = getattr(config, "is_neox_style", True)
 
-        self.self_attn = DFlashQwen3Attention(
-            hidden_size=self.hidden_size,
-            num_heads=config.num_attention_heads,
-            max_position=config.max_position_embeddings,
-            num_kv_heads=config.num_key_value_heads,
-            rms_norm_eps=config.rms_norm_eps,
-            attention_bias=getattr(config, "attention_bias", False),
-            add_swa_attention_sink_bias=add_swa_attention_sink_bias,
-            v_scale=dflash_config.get("attention_value_scale"),
-            sliding_window=sliding_window,
-            causal=causal,
-            is_neox_style=is_neox_style,
-            head_dim=getattr(config, "head_dim", None),
-            cache_config=cache_config,
-            quant_config=quant_config,
-            rope_parameters=config.rope_parameters,
-            prefix=f"{prefix}.self_attn",
-            attn_type=attn_type,
-        )
+        self.self_attn: nn.Module
+        if dflash_config.get("attention_mode") == "mla":
+            from .dflash_mla import DFlashMLAAttention
+
+            self.self_attn = DFlashMLAAttention(
+                config,
+                sliding_window=sliding_window,
+                causal=causal,
+                cache_config=cache_config,
+                quant_config=quant_config,
+                prefix=f"{prefix}.self_attn",
+            )
+        else:
+            self.self_attn = DFlashQwen3Attention(
+                hidden_size=self.hidden_size,
+                num_heads=config.num_attention_heads,
+                max_position=config.max_position_embeddings,
+                num_kv_heads=config.num_key_value_heads,
+                rms_norm_eps=config.rms_norm_eps,
+                attention_bias=getattr(config, "attention_bias", False),
+                add_swa_attention_sink_bias=add_swa_attention_sink_bias,
+                v_scale=dflash_config.get("attention_value_scale"),
+                sliding_window=sliding_window,
+                causal=causal,
+                is_neox_style=is_neox_style,
+                head_dim=getattr(config, "head_dim", None),
+                cache_config=cache_config,
+                quant_config=quant_config,
+                rope_parameters=config.rope_parameters,
+                prefix=f"{prefix}.self_attn",
+                attn_type=attn_type,
+            )
         self.mlp = Qwen3MLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
@@ -497,6 +510,10 @@ class DFlashQwen3Model(nn.Module):
         layer so that precompute_and_store_context_kv can run one fused
         GEMM for all layers at once. Also aliases the weight of the hidden_norm.
         """
+        if (getattr(self.config, "dflash_config", None) or {}).get(
+            "attention_mode"
+        ) == "mla":
+            return
         layers_attn = [layer.self_attn for layer in self.layers]
         attn0 = layers_attn[0]
         has_bias = attn0.qkv_proj.bias is not None
@@ -602,6 +619,22 @@ class DFlashQwen3Model(nn.Module):
         When context_slot_mapping is None (e.g. during dummy_run) only
         the computation runs, and no K/V is written to cache.
         """
+        if (getattr(self.config, "dflash_config", None) or {}).get(
+            "attention_mode"
+        ) == "mla":
+            if context_states.shape[0] == 0:
+                return
+            context_states = self.hidden_norm(context_states)
+            for i, layer in enumerate(self.layers):
+                slots = (
+                    context_slot_mapping[i]
+                    if isinstance(context_slot_mapping, (list, tuple))
+                    else context_slot_mapping
+                )
+                layer.self_attn.precompute_and_store_context_kv(
+                    context_states, context_positions, slots
+                )
+            return
         if not hasattr(self, "_num_attn_layers"):
             logger.warning_once(
                 "DFlash buffer initialization was skipped. If dummy weights are not "

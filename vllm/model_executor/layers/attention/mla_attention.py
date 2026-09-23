@@ -1366,6 +1366,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             return SlidingWindowMLASpec(
                 **common_kwargs,
                 sliding_window=self.sliding_window,
+                non_causal_multi_token_decode=self.non_causal_multi_token_decode,
             )
         return MLAAttentionSpec(
             **common_kwargs,
