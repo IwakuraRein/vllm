@@ -309,6 +309,10 @@ class ModelArchConfigConvertorBase:
         return quant_cfg
 
     def is_deepseek_mla(self) -> bool:
+        if (getattr(self.hf_text_config, "dflash_config", None) or {}).get(
+            "attention_mode"
+        ) == "mla":
+            return getattr(self.hf_text_config, "kv_lora_rank", None) is not None
         if not hasattr(self.hf_text_config, "model_type"):
             return False
         elif self.hf_text_config.model_type in (

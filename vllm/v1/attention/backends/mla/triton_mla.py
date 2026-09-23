@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import math
 from typing import ClassVar
 
 import torch
 
 import vllm.envs as envs
+from vllm.config import get_current_vllm_config
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.mla_attention import (
@@ -26,6 +28,8 @@ from vllm.v1.attention.backend import (
     MultipleOf,
 )
 from vllm.v1.attention.ops.triton_decode_attention import decode_attention_fwd
+from vllm.v1.attention.ops.triton_unified_attention import unified_attention
+from vllm.v1.kv_cache_interface import get_kv_quant_mode
 from vllm.v1.worker.workspace import (
     current_workspace_manager,
     is_workspace_manager_initialized,
@@ -177,11 +181,21 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
             **mla_args,
         )
 
-        unsupported_features = [alibi_slopes, sliding_window, logits_soft_cap]
+        self.sliding_window = sliding_window
+        unsupported_features = [alibi_slopes, logits_soft_cap]
         if any(unsupported_features):
             raise NotImplementedError(
                 "TritonMLAImpl does not support one of the following: "
-                "alibi_slopes, sliding_window, logits_soft_cap"
+                "alibi_slopes, logits_soft_cap"
+            )
+        if sliding_window is not None and self.dcp_world_size > 1:
+            raise NotImplementedError("Windowed Triton MLA does not support DCP.")
+        if (
+            sliding_window is not None
+            and not get_current_vllm_config().attention_config.use_non_causal
+        ):
+            raise NotImplementedError(
+                "Windowed Triton MLA currently supports non-causal draft blocks only."
             )
 
         if attn_type != AttentionType.DECODER:
@@ -240,6 +254,10 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
             q = torch.cat(q, dim=-1)
 
         assert isinstance(q, torch.Tensor)
+        if self.sliding_window is not None:
+            return self._forward_windowed_mqa(
+                q, kv_c_and_k_pe_cache, attn_metadata, layer
+            )
         B = q.shape[0]
         q_num_heads = q.shape[1]
         o = torch.zeros(
@@ -326,3 +344,44 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
         )
 
         return o, lse
+
+    def _forward_windowed_mqa(
+        self,
+        q: torch.Tensor,
+        kv_cache: torch.Tensor,
+        metadata: MLACommonMetadata,
+        layer: AttentionLayer,
+    ) -> tuple[torch.Tensor, None]:
+        """Attend directly to the latent cache with a per-query sliding window."""
+        assert not metadata.causal, "Windowed MLA currently supports draft blocks only."
+        assert self.sliding_window is not None
+        assert metadata.decode is not None
+        # Alias the shared latent across head groups so the unified kernel
+        # tiles at most 16 query heads (576-wide MLA exceeds shared memory
+        # limits when all 64 heads occupy one tile).
+        num_kv_heads = q.shape[1] // math.gcd(q.shape[1], 16)
+        cache = kv_cache.unsqueeze(2).expand(-1, -1, num_kv_heads, -1)
+        # The unified kernel uses equal Q/K/V widths. Its extra RoPE output
+        # columns are discarded; V's first kv_lora_rank columns are the latent.
+        output = torch.empty_like(q)
+        descale = layer._k_scale.expand(metadata.num_decodes, num_kv_heads)
+        unified_attention(
+            q=q,
+            k=cache,
+            v=cache,
+            out=output,
+            cu_seqlens_q=metadata.query_start_loc,
+            max_seqlen_q=metadata.max_query_len,
+            seqused_k=metadata.decode.seq_lens,
+            max_seqlen_k=metadata.max_seq_len,
+            softmax_scale=self.scale,
+            causal=False,
+            window_size=(self.sliding_window - 1, self.sliding_window - 1),
+            block_table=metadata.decode.block_table,
+            softcap=0.0,
+            q_descale=None,
+            k_descale=descale,
+            v_descale=descale,
+            kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
+        )
+        return output[..., : self.kv_lora_rank].contiguous(), None
