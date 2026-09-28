@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
+from copy import copy
 from importlib.util import find_spec
 from typing import TYPE_CHECKING, Any, cast
 
@@ -1291,12 +1292,11 @@ class SpecDecodeBaseProposer:
         )
 
         if spec_cfg.kv_cache_dtype is not None:
+            draft_cache_config = copy(base.cache_config)
+            draft_cache_config.cache_dtype = spec_cfg.kv_cache_dtype
             base = replace(
                 base,
-                cache_config=replace(
-                    base.cache_config,
-                    cache_dtype=spec_cfg.kv_cache_dtype,
-                ),
+                cache_config=draft_cache_config,
             )
 
         return base
