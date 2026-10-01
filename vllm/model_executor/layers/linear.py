@@ -1545,6 +1545,9 @@ class KimiK3MergedQKVGateLinear(MergedColumnParallelLinear):
     tensor-parallel, matching the standalone projections they replace.
     """
 
+    # Q/KV RMSNorm, RoPE/cache insertion, and output gating accept row strides.
+    allow_strided_output = True
+
     def __init__(
         self,
         hidden_size: int,

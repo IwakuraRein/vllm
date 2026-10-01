@@ -2410,7 +2410,9 @@ class _Fp8PbWoPartialBlock(FormatScheme):
         # Run the GEMM on the padded weight without bias, then trim to the
         # logical width and add bias (the padded rows produce zeros we drop).
         out = kernel_apply(layer, x, None)
-        out = out[..., :logical].contiguous()
+        out = out[..., :logical]
+        if not getattr(layer, "allow_strided_output", False):
+            out = out.contiguous()
         return out if bias is None else out.add_(bias)
 
 
