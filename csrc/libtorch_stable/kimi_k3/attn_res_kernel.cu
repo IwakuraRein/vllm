@@ -18,6 +18,7 @@
 #include <cfloat>
 #include <cstdint>
 #include <cstdio>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <type_traits>
 
@@ -229,16 +230,66 @@ __device__ __forceinline__ void cp_async_bulk(void* smem_dst,
       : "memory");
 }
 
+template <int VEC>
+__device__ __forceinline__ void store_fp8_group(uint8_t* output,
+                                                uint32_t* output_scales,
+                                                const bf16_t* values, int row,
+                                                int h_base, int padded_tokens,
+                                                float quant_eps) {
+  constexpr int GROUP_THREADS = 128 / VEC;
+  // Match the standalone quantizer after AttnRes's BF16 rounding boundary.
+  float rounded[VEC];
+  float absmax = quant_eps;
+#pragma unroll
+  for (int j = 0; j < VEC; ++j) {
+    rounded[j] = __bfloat162float(values[j]);
+    absmax = fmaxf(absmax, fabsf(rounded[j]));
+  }
+#pragma unroll
+  for (int offset = GROUP_THREADS / 2; offset > 0; offset >>= 1) {
+    absmax = fmaxf(absmax,
+                   __shfl_xor_sync(0xffffffff, absmax, offset, GROUP_THREADS));
+  }
+  float scale = fmaxf(absmax / 448.f, 1e-10f);
+  uint32_t bits = __float_as_uint(scale);
+  uint32_t exponent = ((bits >> 23) & 0xffu) + ((bits & 0x7fffffu) != 0u);
+  float inv_scale = 1.f / __uint_as_float(exponent << 23);
+  if ((h_base & 127) == 0) {
+    int scale_group = h_base / 128;
+    int scale_index = (scale_group / 4) * padded_tokens + row;
+    reinterpret_cast<uint8_t*>(
+        output_scales)[scale_index * 4 + scale_group % 4] = exponent;
+  }
+  uint32_t packed[VEC / 4] = {};
+#pragma unroll
+  for (int j = 0; j < VEC; j += 2) {
+    float2 q =
+        make_float2(fminf(fmaxf(rounded[j] * inv_scale, -448.f), 448.f),
+                    fminf(fmaxf(rounded[j + 1] * inv_scale, -448.f), 448.f));
+    uint32_t pair = __nv_cvt_float2_to_fp8x2(q, __NV_SATFINITE, __NV_E4M3);
+    packed[j / 4] |= pair << ((j & 3) * 8);
+  }
+  if constexpr (VEC == 8) {
+    *reinterpret_cast<uint2*>(output + h_base) =
+        make_uint2(packed[0], packed[1]);
+  } else {
+    static_assert(VEC == 4);
+    *reinterpret_cast<uint32_t*>(output + h_base) = packed[0];
+  }
+}
+
 template <int H, int N, int NC = N_CHUNK_DEFAULT, int B = 1,
           bool RELEASE_TMEM = false, bool STATIC_COMMON_PATH = false,
-          bool HAS_OUTPUT_NORM = false>
+          bool HAS_OUTPUT_NORM = false, bool QUANTIZE_FP8 = false>
 __global__ void __launch_bounds__(BLK, 1) attn_res_fwd_online_v2_kernel(
     bf16_t* __restrict__ block_res, bf16_t* __restrict__ layer_res,
     const bf16_t* __restrict__ delta, const bf16_t* __restrict__ res_w,
-    const bf16_t* __restrict__ rms_w, bf16_t* __restrict__ output, int T,
-    int block_stride_m, int block_stride_r, float rms_eps,
+    const bf16_t* __restrict__ rms_w,
+    std::conditional_t<QUANTIZE_FP8, uint8_t, bf16_t>* __restrict__ output,
+    int T, int block_stride_m, int block_stride_r, float rms_eps,
     const bf16_t* __restrict__ output_norm_weight, float output_norm_eps,
-    int block_write_idx) {
+    int block_write_idx, uint32_t* __restrict__ output_scales,
+    float quant_eps) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000 && __CUDA_ARCH__ < 1100
   constexpr float LOG2_E = 1.4426950408889634f;
   constexpr int N_CHUNK = NC;
@@ -272,6 +323,17 @@ __global__ void __launch_bounds__(BLK, 1) attn_res_fwd_online_v2_kernel(
   const int ct_in_group =
       (comp_tid >= 0) ? (comp_tid & (CONSUMER_THREADS_PER_GROUP - 1)) : -1;
   const int k_local = ct_in_group * VEC;
+
+  const int padded_tokens = (T + 3) / 4 * 4;
+  if constexpr (QUANTIZE_FP8) {
+    // empty_strided([T, H / 512], [1, padded_tokens]) omits the final
+    // column's trailing padding from its allocation.
+    if (blockIdx.x == 0 && comp_tid >= 0 && comp_tid < H / 512 - 1) {
+      for (int row = T; row < padded_tokens; ++row) {
+        output_scales[comp_tid * padded_tokens + row] = 0;
+      }
+    }
+  }
 
   constexpr size_t V_BYTES = (size_t)NUM_BUFS * H * sizeof(bf16_t);
   constexpr size_t DELTA_BYTES = (size_t)CHUNK_DEPTH * H * sizeof(bf16_t);
@@ -608,6 +670,8 @@ __global__ void __launch_bounds__(BLK, 1) attn_res_fwd_online_v2_kernel(
         if (stat_n < N_CHUNK) {
           totals = plan.ws_stats[stat_w][stat_n];
         }
+        // All warps must finish reading before a later reduction reuses stats.
+        named_barrier_sync(CONSUMER_THREADS, 0);
   #pragma unroll
         for (int offset = CONSUMER_WARPS / 2; offset > 0; offset >>= 1) {
           totals.x +=
@@ -758,7 +822,7 @@ __global__ void __launch_bounds__(BLK, 1) attn_res_fwd_online_v2_kernel(
       }
 
       float inv_s = 1.f / s_running;
-      bf16_t* out_ptr = output + (long long)tb * H;
+      auto* out_ptr = output + (long long)tb * H;
       float2 output_sq_pair = {};
       // When output RMSNorm is fused, the softmax denominator cancels:
       // (acc / s) * rsqrt(mean((acc / s)^2) + eps)
@@ -783,7 +847,13 @@ __global__ void __launch_bounds__(BLK, 1) attn_res_fwd_online_v2_kernel(
               }
             }
             if constexpr (!HAS_OUTPUT_NORM) {
-              *reinterpret_cast<uint2*>(out_ptr + h_base) = packed;
+              if constexpr (QUANTIZE_FP8) {
+                store_fp8_group<4>(out_ptr, output_scales,
+                                   reinterpret_cast<bf16_t*>(&packed), tb,
+                                   h_base, padded_tokens, quant_eps);
+              } else {
+                *reinterpret_cast<uint2*>(out_ptr + h_base) = packed;
+              }
             }
             continue;
           }
@@ -806,7 +876,13 @@ __global__ void __launch_bounds__(BLK, 1) attn_res_fwd_online_v2_kernel(
           }
         }
         if constexpr (!HAS_OUTPUT_NORM) {
-          *reinterpret_cast<uint4*>(out_ptr + h_base) = packed;
+          if constexpr (QUANTIZE_FP8) {
+            store_fp8_group<VEC>(out_ptr, output_scales,
+                                 reinterpret_cast<bf16_t*>(&packed), tb, h_base,
+                                 padded_tokens, quant_eps);
+          } else {
+            *reinterpret_cast<uint4*>(out_ptr + h_base) = packed;
+          }
         }
       }
 
@@ -825,6 +901,7 @@ __global__ void __launch_bounds__(BLK, 1) attn_res_fwd_online_v2_kernel(
         }
         named_barrier_sync(CONSUMER_THREADS, 0);
         float total_sq = lane < CONSUMER_WARPS ? plan.ws_stats[lane][0].x : 0.f;
+        named_barrier_sync(CONSUMER_THREADS, 0);
   #pragma unroll
         for (int offset = CONSUMER_WARPS / 2; offset > 0; offset >>= 1) {
           total_sq +=
@@ -848,7 +925,12 @@ __global__ void __launch_bounds__(BLK, 1) attn_res_fwd_online_v2_kernel(
                 values[j] = __float2bfloat16(acc32[si * VEC + j] *
                                              output_rsigma * weight);
               }
-              *reinterpret_cast<uint2*>(out_ptr + h_base) = packed;
+              if constexpr (QUANTIZE_FP8) {
+                store_fp8_group<4>(out_ptr, output_scales, values, tb, h_base,
+                                   padded_tokens, quant_eps);
+              } else {
+                *reinterpret_cast<uint2*>(out_ptr + h_base) = packed;
+              }
               continue;
             }
           }
@@ -863,7 +945,12 @@ __global__ void __launch_bounds__(BLK, 1) attn_res_fwd_online_v2_kernel(
             values[j] =
                 __float2bfloat16(acc32[si * VEC + j] * output_rsigma * weight);
           }
-          *reinterpret_cast<uint4*>(out_ptr + h_base) = packed;
+          if constexpr (QUANTIZE_FP8) {
+            store_fp8_group<VEC>(out_ptr, output_scales, values, tb, h_base,
+                                 padded_tokens, quant_eps);
+          } else {
+            *reinterpret_cast<uint4*>(out_ptr + h_base) = packed;
+          }
         }
       }
     }
@@ -881,22 +968,24 @@ __global__ void __launch_bounds__(BLK, 1) attn_res_fwd_online_v2_kernel(
 }
 
 template <int H, int N, int NC = N_CHUNK_DEFAULT, bool RELEASE_TMEM = false,
-          bool STATIC_COMMON_PATH = false, bool HAS_OUTPUT_NORM = false>
-static void launch_fwd(bf16_t* block_residual, bf16_t* layer_residual,
-                       const bf16_t* delta, const bf16_t* res_weight,
-                       const bf16_t* rms_weight, bf16_t* output, int T,
-                       float rms_eps, int num_sm, cudaStream_t stream,
-                       const bf16_t* output_norm_weight = nullptr,
-                       float output_norm_eps = 0.f, int block_stride_m = 0,
-                       int block_stride_r = 0, int block_write_idx = -1) {
+          bool STATIC_COMMON_PATH = false, bool HAS_OUTPUT_NORM = false,
+          bool QUANTIZE_FP8 = false>
+static void launch_fwd(
+    bf16_t* block_residual, bf16_t* layer_residual, const bf16_t* delta,
+    const bf16_t* res_weight, const bf16_t* rms_weight,
+    std::conditional_t<QUANTIZE_FP8, uint8_t, bf16_t>* output, int T,
+    float rms_eps, int num_sm, cudaStream_t stream,
+    const bf16_t* output_norm_weight = nullptr, float output_norm_eps = 0.f,
+    int block_stride_m = 0, int block_stride_r = 0, int block_write_idx = -1,
+    uint32_t* output_scales = nullptr, float quant_eps = 1e-10f) {
   constexpr size_t smem_size =
       ((size_t)(CHUNK_DEPTH * (NC + 1) + (HAS_OUTPUT_NORM ? 1 : 0)) * H *
            sizeof(bf16_t) +
        sizeof(FwdSmemPlan<NC>) + 15) &
       ~size_t(15);
-  auto kernel =
-      &attn_res_fwd_online_v2_kernel<H, N, NC, 1, RELEASE_TMEM,
-                                     STATIC_COMMON_PATH, HAS_OUTPUT_NORM>;
+  auto kernel = &attn_res_fwd_online_v2_kernel<H, N, NC, 1, RELEASE_TMEM,
+                                               STATIC_COMMON_PATH,
+                                               HAS_OUTPUT_NORM, QUANTIZE_FP8>;
   static bool attrs_set = false;
   if (!attrs_set) {
     if (smem_size > 48 * 1024) {
@@ -919,21 +1008,22 @@ static void launch_fwd(bf16_t* block_residual, bf16_t* layer_residual,
   cudaLaunchKernelEx(&config, kernel, block_residual, layer_residual, delta,
                      res_weight, rms_weight, output, T, block_stride_m,
                      block_stride_r, rms_eps, output_norm_weight,
-                     output_norm_eps, block_write_idx);
+                     output_norm_eps, block_write_idx, output_scales,
+                     quant_eps);
 }
 
 }  // namespace fwd_prod_v2
 }  // namespace sm100
 
-void kimi_k3_attn_res(torch::stable::Tensor& prefix,
-                      std::optional<torch::stable::Tensor> delta,
-                      torch::stable::Tensor& blocks,
-                      torch::stable::Tensor const& norm_weight,
-                      torch::stable::Tensor const& qk_weight,
-                      std::optional<torch::stable::Tensor> output_norm_weight,
-                      torch::stable::Tensor& output, int64_t num_blocks,
-                      int64_t block_write_idx, double eps,
-                      double output_norm_eps) {
+template <bool QUANTIZE_FP8>
+static void kimi_k3_attn_res_impl(
+    torch::stable::Tensor& prefix, std::optional<torch::stable::Tensor> delta,
+    torch::stable::Tensor& blocks, torch::stable::Tensor const& norm_weight,
+    torch::stable::Tensor const& qk_weight,
+    std::optional<torch::stable::Tensor> output_norm_weight,
+    torch::stable::Tensor& output, int64_t num_blocks, int64_t block_write_idx,
+    double eps, double output_norm_eps,
+    torch::stable::Tensor* output_scales = nullptr, double quant_eps = 1e-10) {
   int const num_tokens = static_cast<int>(prefix.size(0));
   int const device = prefix.get_device_index();
   torch::stable::accelerator::DeviceGuard const device_guard(device);
@@ -944,6 +1034,44 @@ void kimi_k3_attn_res(torch::stable::Tensor& prefix,
   STD_TORCH_CHECK(hidden_size == 7168,
                   "Kimi K3 AttnRes requires hidden_size=7168, got ",
                   hidden_size);
+  if constexpr (QUANTIZE_FP8) {
+    STD_TORCH_CHECK(
+        prefix.scalar_type() == torch::headeronly::ScalarType::BFloat16 &&
+            blocks.scalar_type() == torch::headeronly::ScalarType::BFloat16 &&
+            norm_weight.scalar_type() ==
+                torch::headeronly::ScalarType::BFloat16 &&
+            qk_weight.scalar_type() ==
+                torch::headeronly::ScalarType::BFloat16 &&
+            (!delta.has_value() ||
+             delta->scalar_type() == torch::headeronly::ScalarType::BFloat16) &&
+            (!output_norm_weight.has_value() ||
+             output_norm_weight->scalar_type() ==
+                 torch::headeronly::ScalarType::BFloat16),
+        "Kimi K3 AttnRes FP8 requires BF16 inputs");
+    STD_TORCH_CHECK(
+        output.scalar_type() == torch::headeronly::ScalarType::Float8_e4m3fn,
+        "Kimi K3 AttnRes FP8 requires Float8_e4m3fn output");
+    STD_TORCH_CHECK(output.dim() == 2 && output.size(0) == num_tokens &&
+                        output.size(1) == hidden_size && output.is_contiguous(),
+                    "Kimi K3 AttnRes FP8 output must be contiguous [T, 7168]");
+    int padded_tokens = (num_tokens + 3) / 4 * 4;
+    STD_TORCH_CHECK(
+        output_scales != nullptr &&
+            output_scales->scalar_type() ==
+                torch::headeronly::ScalarType::Int &&
+            output_scales->dim() == 2 && output_scales->size(0) == num_tokens &&
+            output_scales->size(1) == hidden_size / 512 &&
+            output_scales->stride(0) == 1 &&
+            output_scales->stride(1) == padded_tokens,
+        "Kimi K3 AttnRes FP8 scales must be int32 [T, 14] with strides "
+        "[1, round_up(T, 4)]");
+    STD_TORCH_CHECK(output.get_device_index() == device &&
+                        output_scales->get_device_index() == device,
+                    "Kimi K3 AttnRes FP8 outputs must share the input device");
+    STD_TORCH_CHECK(
+        quant_eps > 0 && quant_eps <= FLT_MAX,
+        "Kimi K3 AttnRes FP8 quant_eps must be positive and finite");
+  }
   STD_TORCH_CHECK(prefix.stride(0) == hidden_size &&
                       (!delta.has_value() || delta->stride(0) == hidden_size) &&
                       output.stride(0) == hidden_size,
@@ -971,22 +1099,26 @@ void kimi_k3_attn_res(torch::stable::Tensor& prefix,
     auto dispatch = [&](auto source_count) {
       constexpr int NUM_SOURCES = decltype(source_count)::value;
       launch_fwd<7168, NUM_SOURCES, 3, false, STATIC_COMMON_PATH,
-                 HAS_OUTPUT_NORM>(
+                 HAS_OUTPUT_NORM, QUANTIZE_FP8>(
           static_cast<bf16_t*>(blocks.data_ptr()),
           static_cast<bf16_t*>(prefix.data_ptr()),
           delta.has_value() ? static_cast<bf16_t const*>(delta->data_ptr())
                             : nullptr,
           static_cast<bf16_t const*>(qk_weight.data_ptr()),
           static_cast<bf16_t const*>(norm_weight.data_ptr()),
-          static_cast<bf16_t*>(output.data_ptr()), num_tokens,
-          static_cast<float>(eps), properties->multiProcessorCount, stream,
+          static_cast<std::conditional_t<QUANTIZE_FP8, uint8_t, bf16_t>*>(
+              output.data_ptr()),
+          num_tokens, static_cast<float>(eps), properties->multiProcessorCount,
+          stream,
           output_norm_weight.has_value()
               ? static_cast<bf16_t const*>(output_norm_weight->data_ptr())
               : nullptr,
           static_cast<float>(output_norm_eps),
           static_cast<int>(blocks.stride(0)),
-          static_cast<int>(blocks.stride(1)),
-          static_cast<int>(block_write_idx));
+          static_cast<int>(blocks.stride(1)), static_cast<int>(block_write_idx),
+          QUANTIZE_FP8 ? static_cast<uint32_t*>(output_scales->data_ptr())
+                       : nullptr,
+          static_cast<float>(quant_eps));
     };
     switch (num_blocks) {
       case 0:
@@ -1030,4 +1162,32 @@ void kimi_k3_attn_res(torch::stable::Tensor& prefix,
   STD_TORCH_CHECK(
       error == cudaSuccess,
       "Kimi K3 AttnRes kernel launch failed: ", cudaGetErrorString(error));
+}
+
+void kimi_k3_attn_res(torch::stable::Tensor& prefix,
+                      std::optional<torch::stable::Tensor> delta,
+                      torch::stable::Tensor& blocks,
+                      torch::stable::Tensor const& norm_weight,
+                      torch::stable::Tensor const& qk_weight,
+                      std::optional<torch::stable::Tensor> output_norm_weight,
+                      torch::stable::Tensor& output, int64_t num_blocks,
+                      int64_t block_write_idx, double eps,
+                      double output_norm_eps) {
+  kimi_k3_attn_res_impl<false>(prefix, delta, blocks, norm_weight, qk_weight,
+                               output_norm_weight, output, num_blocks,
+                               block_write_idx, eps, output_norm_eps);
+}
+
+void kimi_k3_attn_res_fp8(
+    torch::stable::Tensor& prefix, std::optional<torch::stable::Tensor> delta,
+    torch::stable::Tensor& blocks, torch::stable::Tensor const& norm_weight,
+    torch::stable::Tensor const& qk_weight,
+    std::optional<torch::stable::Tensor> output_norm_weight,
+    torch::stable::Tensor& output, int64_t num_blocks, int64_t block_write_idx,
+    double eps, double output_norm_eps, torch::stable::Tensor& output_scales,
+    double quant_eps) {
+  kimi_k3_attn_res_impl<true>(prefix, delta, blocks, norm_weight, qk_weight,
+                              output_norm_weight, output, num_blocks,
+                              block_write_idx, eps, output_norm_eps,
+                              &output_scales, quant_eps);
 }

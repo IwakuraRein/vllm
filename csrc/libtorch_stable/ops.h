@@ -456,6 +456,14 @@ void kimi_k3_attn_res(torch::stable::Tensor& prefix,
                       torch::stable::Tensor& output, int64_t num_blocks,
                       int64_t block_write_idx, double eps,
                       double output_norm_eps);
+void kimi_k3_attn_res_fp8(
+    torch::stable::Tensor& prefix, std::optional<torch::stable::Tensor> delta,
+    torch::stable::Tensor& blocks, torch::stable::Tensor const& norm_weight,
+    torch::stable::Tensor const& qk_weight,
+    std::optional<torch::stable::Tensor> output_norm_weight,
+    torch::stable::Tensor& output, int64_t num_blocks, int64_t block_write_idx,
+    double eps, double output_norm_eps, torch::stable::Tensor& output_scales,
+    double quant_eps);
 #endif
 
 // Sampler kernels (shared CUDA/ROCm)

@@ -7,6 +7,10 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from vllm import _custom_ops as ops
+from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+    per_token_group_quant_fp8_packed_for_deepgemm,
+)
 from vllm.models.kimi_k3.common.mtp import fused_mtp_input
 from vllm.models.kimi_k3.nvidia.ops import attn_res
 from vllm.platforms import current_platform
@@ -268,6 +272,174 @@ def test_sm100_variants_do_not_fall_back_to_triton(
         EPS,
         EPS,
     )
+
+
+def _require_native_attn_res_fp8() -> None:
+    if not current_platform.is_device_capability_family(100) or not hasattr(
+        torch.ops._C, "kimi_k3_attn_res_fp8"
+    ):
+        pytest.skip("native FP8 AttnRes requires an SM100 build")
+
+
+def _assert_packed_fp8_equal(
+    actual: tuple[torch.Tensor, torch.Tensor],
+    expected: tuple[torch.Tensor, torch.Tensor],
+) -> None:
+    actual_q, actual_scales = actual
+    expected_q, expected_scales = expected
+    torch.testing.assert_close(
+        actual_q.view(torch.uint8), expected_q.view(torch.uint8), atol=0, rtol=0
+    )
+    torch.testing.assert_close(actual_scales, expected_scales, atol=0, rtol=0)
+    assert actual_q.is_contiguous()
+    assert actual_scales.stride() == expected_scales.stride()
+    num_tokens, scale_words = actual_scales.shape
+    padded_tokens = actual_scales.stride(1)
+    # The last column's trailing padding is outside empty_strided's storage.
+    for scales in (actual_scales, expected_scales):
+        padding = scales.as_strided(
+            (scale_words - 1, padded_tokens - num_tokens),
+            (padded_tokens, 1),
+            storage_offset=num_tokens,
+        )
+        assert torch.count_nonzero(padding).item() == 0
+
+
+@pytest.mark.parametrize(
+    (
+        "num_tokens",
+        "num_blocks",
+        "has_delta",
+        "has_output_norm",
+        "write_block",
+        "capture_graph",
+    ),
+    [
+        *[
+            pytest.param(5, n, True, True, False, False, id=f"blocks-{n}")
+            for n in range(MAX_BLOCKS + 1)
+        ],
+        pytest.param(1, 0, False, True, True, False, id="first-block-write"),
+        pytest.param(2, 1, True, True, False, False, id="padding-two"),
+        pytest.param(3, 1, True, True, False, False, id="padding-one"),
+        pytest.param(4, 1, True, True, False, False, id="no-padding"),
+        pytest.param(17, 4, True, True, True, False, id="block-write"),
+        pytest.param(129, 8, False, True, False, True, id="graph-no-delta"),
+        pytest.param(17, 8, True, False, False, False, id="without-output-norm"),
+        pytest.param(16377, 6, True, True, True, True, id="prefill-block-write"),
+    ],
+)
+def test_attn_res_fp8_matches_two_kernels(
+    num_tokens: int,
+    num_blocks: int,
+    has_delta: bool,
+    has_output_norm: bool,
+    write_block: bool,
+    capture_graph: bool,
+):
+    """Fusion preserves quantized outputs and all residual-state updates."""
+    _require_native_attn_res_fp8()
+    torch.manual_seed(0)
+    prefix = torch.randn(num_tokens, HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16)
+    delta = torch.randn_like(prefix) if has_delta else None
+    capacity = max(1, num_blocks + int(write_block))
+    blocks = torch.randn(
+        num_tokens, capacity, HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16
+    )
+    expected_prefix, expected_blocks = prefix.clone(), blocks.clone()
+    norm_weight = 1 + 0.1 * torch.randn(
+        HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16
+    )
+    qk_weight = torch.randn_like(norm_weight) / HIDDEN_SIZE**0.5
+    output_norm_weight = (
+        1 + 0.1 * torch.randn_like(norm_weight) if has_output_norm else None
+    )
+    block_write_idx = num_blocks if write_block else -1
+
+    def unfused():
+        output = ops.kimi_k3_attn_res(
+            expected_prefix,
+            delta,
+            expected_blocks,
+            norm_weight,
+            qk_weight,
+            output_norm_weight,
+            num_blocks,
+            block_write_idx,
+            EPS,
+            EPS,
+        )
+        return per_token_group_quant_fp8_packed_for_deepgemm(
+            output, 128, eps=1e-10, use_ue8m0=True
+        )
+
+    def fused():
+        return ops.kimi_k3_attn_res_fp8(
+            prefix,
+            delta,
+            blocks,
+            norm_weight,
+            qk_weight,
+            output_norm_weight,
+            num_blocks,
+            block_write_idx,
+            EPS,
+            EPS,
+        )
+
+    def check(actual, expected):
+        _assert_packed_fp8_equal(actual, expected)
+        torch.testing.assert_close(prefix, expected_prefix, atol=0, rtol=0)
+        torch.testing.assert_close(blocks, expected_blocks, atol=0, rtol=0)
+
+    expected = unfused()
+    actual = fused()
+    check(actual, expected)
+    if capture_graph:
+        torch.accelerator.synchronize()
+        unfused_graph, fused_graph = torch.cuda.CUDAGraph(), torch.cuda.CUDAGraph()
+        with torch.cuda.graph(unfused_graph):
+            expected = unfused()
+        with torch.cuda.graph(fused_graph):
+            actual = fused()
+        for _ in range(3):
+            unfused_graph.replay()
+            fused_graph.replay()
+            check(actual, expected)
+
+
+def test_attn_res_fp8_scale_rounding_boundaries():
+    """Match scale clamping and upward exponent rounding at BF16 boundaries."""
+    _require_native_attn_res_fp8()
+    boundary = torch.ldexp(
+        torch.full((4,), 448.0, device="cuda"),
+        torch.tensor([-20, -8, 0, 8], device="cuda"),
+    ).to(torch.bfloat16)
+    group_maxima = torch.cat(
+        (
+            torch.tensor(
+                [0, 2**-133, 2**-126, 1e-8], device="cuda", dtype=torch.bfloat16
+            ),
+            torch.nextafter(boundary, torch.zeros_like(boundary)),
+            boundary,
+            torch.nextafter(boundary, torch.full_like(boundary, float("inf"))),
+        )
+    ).repeat(4)[: HIDDEN_SIZE // 128]
+    prefix = group_maxima.repeat_interleave(128).expand(5, -1).clone()
+    prefix[:, 1::2].neg_()
+    blocks = torch.zeros(5, 1, HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16)
+    norm_weight = torch.ones(HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16)
+    qk_weight = torch.zeros_like(norm_weight)
+    output = ops.kimi_k3_attn_res(
+        prefix, None, blocks, norm_weight, qk_weight, None, 0, -1, EPS, EPS
+    )
+    expected = per_token_group_quant_fp8_packed_for_deepgemm(
+        output, 128, eps=1e-10, use_ue8m0=True
+    )
+    actual = ops.kimi_k3_attn_res_fp8(
+        prefix, None, blocks, norm_weight, qk_weight, None, 0, -1, EPS, EPS
+    )
+    _assert_packed_fp8_equal(actual, expected)
 
 
 @pytest.mark.parametrize("num_tokens", [0, 1, 17])

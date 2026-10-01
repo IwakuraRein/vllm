@@ -2806,6 +2806,53 @@ def kimi_k3_attn_res(
     return output
 
 
+def kimi_k3_attn_res_fp8(
+    prefix: torch.Tensor,
+    delta: torch.Tensor | None,
+    blocks: torch.Tensor,
+    norm_weight: torch.Tensor,
+    qk_weight: torch.Tensor,
+    output_norm_weight: torch.Tensor | None,
+    num_blocks: int,
+    block_write_idx: int,
+    eps: float,
+    output_norm_eps: float,
+    quant_eps: float = 1e-10,
+    *,
+    output: torch.Tensor | None = None,
+    output_scales: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """AttnRes with group-128 FP8 output and DeepGEMM packed UE8M0 scales."""
+    num_tokens, hidden_size = prefix.shape
+    if output is None:
+        output = torch.empty(
+            prefix.shape, dtype=torch.float8_e4m3fn, device=prefix.device
+        )
+    if output_scales is None:
+        output_scales = torch.empty_strided(
+            (num_tokens, hidden_size // 512),
+            (1, (num_tokens + 3) // 4 * 4),
+            dtype=torch.int32,
+            device=prefix.device,
+        )
+    torch.ops._C.kimi_k3_attn_res_fp8(
+        prefix,
+        delta,
+        blocks,
+        norm_weight,
+        qk_weight,
+        output_norm_weight,
+        output,
+        num_blocks,
+        block_write_idx,
+        eps,
+        output_norm_eps,
+        output_scales,
+        quant_eps,
+    )
+    return output, output_scales
+
+
 def concat_and_cache_mla_rope_fused(
     positions: torch.Tensor,
     q_pe: torch.Tensor,
