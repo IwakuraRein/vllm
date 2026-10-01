@@ -848,7 +848,11 @@ def test_modelopt_mixed_precision_builds_w4a16_sibling_config():
     assert config.w4a16_nvfp4_config.quant_method == "W4A16_NVFP4"
 
 
-def test_modelopt_fp8_pb_wo_hides_output_padding(monkeypatch):
+@pytest.mark.parametrize("allow_strided_output", [False, True])
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_modelopt_fp8_pb_wo_hides_output_padding(
+    monkeypatch, allow_strided_output, with_bias
+):
     """FP8_PB_WO output width that is not a multiple of 128 (a partial trailing
     block) is padded up to a block boundary before the kernel post-load, the
     GEMM runs on the padded weight, and the output is trimmed back to the
@@ -861,6 +865,7 @@ def test_modelopt_fp8_pb_wo_hides_output_padding(monkeypatch):
     padded to 2688 = 21 * 128.
     """
     from vllm.config.quantization import QuantSpec
+    from vllm.model_executor.layers.linear import KimiK3MergedQKVGateLinear
     from vllm.model_executor.layers.quantization import modelopt as mo
     from vllm.model_executor.layers.quantization.utils.quant_utils import (
         kFp8Dynamic128Sym,
@@ -881,7 +886,9 @@ def test_modelopt_fp8_pb_wo_hides_output_padding(monkeypatch):
     method.input_dtype = method.out_dtype = torch.bfloat16
     method.marlin_input_dtype = None
 
-    layer = torch.nn.Module()
+    layer_cls = KimiK3MergedQKVGateLinear if allow_strided_output else torch.nn.Module
+    layer = layer_cls.__new__(layer_cls)
+    torch.nn.Module.__init__(layer)
     with (
         patch(
             "vllm.model_executor.parameter.get_tensor_model_parallel_rank",
@@ -913,12 +920,18 @@ def test_modelopt_fp8_pb_wo_hides_output_padding(monkeypatch):
     # apply: GEMM on padded weight (bias=None), output trimmed + bias added
     physical_output = torch.randn(4, 2688, dtype=torch.bfloat16)
     kernel.apply_weights.return_value = physical_output
-    bias = torch.randn(2624, dtype=torch.bfloat16)
+    expected = physical_output[:, :2624].clone()
+    padding = physical_output[:, 2624:].clone()
+    bias = torch.randn(2624, dtype=torch.bfloat16) if with_bias else None
+    if bias is not None:
+        expected.add_(bias)
     output = method.apply(layer, torch.randn(4, 128), bias)
 
-    torch.testing.assert_close(output, physical_output[:, :2624] + bias)
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+    torch.testing.assert_close(physical_output[:, 2624:], padding, rtol=0, atol=0)
     assert output.shape == (4, 2624)
-    assert output.is_contiguous()
+    assert output.is_contiguous() == (not allow_strided_output)
+    assert (output.data_ptr() == physical_output.data_ptr()) == allow_strided_output
     kernel.apply_weights.assert_called_once()
     assert kernel.apply_weights.call_args.kwargs["bias"] is None
 

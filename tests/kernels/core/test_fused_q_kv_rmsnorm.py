@@ -53,8 +53,11 @@ def test_fused_q_kv_rmsnorm_correctness(num_tokens: int, dtype: torch.dtype):
     torch.testing.assert_close(kv_out, kv_ref, **tol)
 
 
-@pytest.mark.parametrize("num_tokens", [1, 16])
-def test_fused_q_kv_rmsnorm_outputs_are_packed(num_tokens: int):
+@pytest.mark.parametrize("num_tokens", [1, 16, 16377])
+@pytest.mark.parametrize("q_size,kv_size,padding", [(192, 576, 0), (1536, 512, 1664)])
+def test_fused_q_kv_rmsnorm_outputs_are_packed(
+    num_tokens: int, q_size: int, kv_size: int, padding: int
+):
     """Regression guard: the outputs must be packed row-major even when the
     inputs are column slices of a wider fused-projection buffer.
 
@@ -65,9 +68,10 @@ def test_fused_q_kv_rmsnorm_outputs_are_packed(num_tokens: int):
     back to a slower GEMM path on every decode step."""
     device = "cuda"
     dtype = torch.bfloat16
-    q_size, kv_size = 192, 576
-    fused = torch.randn(num_tokens, q_size + kv_size, dtype=dtype, device=device)
-    qr, kv = fused.split([q_size, kv_size], dim=-1)
+    fused = torch.randn(
+        num_tokens, q_size + kv_size + padding, dtype=dtype, device=device
+    )
+    qr, kv = fused[:, : q_size + kv_size].split([q_size, kv_size], dim=-1)
     qw = torch.randn(q_size, dtype=dtype, device=device)
     kvw = torch.randn(kv_size, dtype=dtype, device=device)
     eps = 1e-6

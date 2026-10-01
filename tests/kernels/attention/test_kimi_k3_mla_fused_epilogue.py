@@ -141,7 +141,8 @@ def test_prefill_epilogue_fuses_gptj_rope(cache_kind: str) -> None:
     cos_sin_cache = _rope_cache()
     q = _randn(_NUM_TOKENS, _NUM_HEADS, 192)
     k_nope = _randn(_NUM_TOKENS, _NUM_HEADS, 128)
-    k_pe = _randn(_NUM_TOKENS, 64)
+    # Preserve the padded QKV/gate projection's row stride and column offset.
+    k_pe = _randn(_NUM_TOKENS, 3712)[:, 2048:2112]
     kv_c = _randn(_NUM_TOKENS, 512)
     v = _randn(_NUM_TOKENS, _NUM_HEADS, 128)
 
@@ -224,7 +225,7 @@ def test_decode_epilogue_fuses_gptj_rope(cache_kind: str) -> None:
     ql_nope = _randn(_NUM_TOKENS, _NUM_HEADS, 512)
     q_pe = _randn(_NUM_TOKENS, _NUM_HEADS, 64)
     kv_c = _randn(_NUM_TOKENS, 512)
-    k_pe = _randn(_NUM_TOKENS, 64)
+    k_pe = _randn(_NUM_TOKENS, 3712)[:, 2048:2112]
 
     q_pe_expected = _apply_gptj_rope(q_pe, positions, cos_sin_cache)
     k_pe_expected = _apply_gptj_rope(k_pe, positions, cos_sin_cache)
