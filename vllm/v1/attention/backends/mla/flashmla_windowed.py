@@ -98,9 +98,9 @@ class FlashMLAWindowedImpl(TritonMLAImpl):
         )
         width = triton.cdiv(max(1, max_keys), 128) * 128
         indices = torch.empty(
-            (q.shape[0], 1, width), dtype=torch.int32, device=q.device
+            (q.shape[0], 1, width), -1, dtype=torch.int32, device=q.device
         )
-        lengths = torch.empty(q.shape[0], dtype=torch.int32, device=q.device)
+        lengths = torch.zeros(q.shape[0], dtype=torch.int32, device=q.device)
         _window_indices_kernel[(metadata.num_decodes, metadata.max_query_len)](
             metadata.query_start_loc,
             metadata.decode.seq_lens,
