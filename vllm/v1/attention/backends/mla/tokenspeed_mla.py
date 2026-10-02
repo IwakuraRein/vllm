@@ -227,7 +227,7 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
                 q_dtype=q_dtype,
                 d_qk=self.qk_nope_head_dim + self.qk_rope_head_dim,
                 d_v=self.v_head_dim,
-                enable_pdl=False,
+                enable_pdl=True,
             )
 
     def forward_mqa(
@@ -305,7 +305,7 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
             max_seq_len=attn_metadata.max_seq_len,
             softmax_scale=self.softmax_scale,
             output_scale=self.output_scale,
-            enable_pdl=False,
+            enable_pdl=True,
             return_lse=return_lse,
             causal_mask=attn_metadata.causal,
             causal_seqs=causal_seqs if self.dcp_world_size > 1 else None,
