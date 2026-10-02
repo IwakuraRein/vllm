@@ -99,7 +99,7 @@ class TokenspeedMLAPrefillBackend(MLAPrefillBackend):
                 q_dtype=q_dtype,
                 d_qk=qk_nope_head_dim + qk_rope_head_dim,
                 d_v=v_head_dim,
-                enable_pdl=False,
+                enable_pdl=True,
             )
 
     def prepare_metadata(
@@ -151,7 +151,7 @@ class TokenspeedMLAPrefillBackend(MLAPrefillBackend):
             softmax_scale=self.scale,
             is_causal=True,
             return_lse=return_softmax_lse,
-            enable_pdl=False,
+            enable_pdl=True,
             out=out,
         )
 
@@ -188,7 +188,7 @@ class TokenspeedMLAPrefillBackend(MLAPrefillBackend):
             return_lse=True,
             cum_seq_lens_q=chunk.query_start_loc,
             max_seq_len_q=chunk.max_query_len,
-            enable_pdl=False,
+            enable_pdl=True,
             out=out,
         )
 
