@@ -97,7 +97,7 @@ class FlashMLAWindowedImpl(TritonMLAImpl):
             self.sliding_window + metadata.max_query_len - 1,
         )
         width = triton.cdiv(max(1, max_keys), 128) * 128
-        indices = torch.empty(
+        indices = torch.full(
             (q.shape[0], 1, width), -1, dtype=torch.int32, device=q.device
         )
         lengths = torch.zeros(q.shape[0], dtype=torch.int32, device=q.device)
