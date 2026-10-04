@@ -47,11 +47,11 @@ class DFlashMLAAttention(nn.Module):
         if config.q_lora_rank is None:
             raise ValueError("MLA DFlash requires q_lora_rank.")
         parallel_config = get_current_vllm_config().parallel_config
-        if (
-            parallel_config.decode_context_parallel_size > 1
-            or parallel_config.prefill_context_parallel_size > 1
-        ):
-            raise ValueError("MLA DFlash does not yet support context parallelism.")
+        if parallel_config.prefill_context_parallel_size > 1:
+            raise ValueError(
+                "MLA DFlash does not yet support prefill context parallelism."
+            )
+        use_dcp = parallel_config.decode_context_parallel_size > 1
 
         self.causal = causal
         self.sliding_window = sliding_window
@@ -139,6 +139,13 @@ class DFlashMLAAttention(nn.Module):
                 and is_flashmla_sparse_supported()[0]
             ):
                 attn_backend = FlashMLAWindowedBackend
+            elif use_dcp:
+                raise ValueError(
+                    "MLA DFlash with decode context parallelism runs its window "
+                    "layers on FLASHMLA_WINDOWED, which needs FlashMLA sparse "
+                    "support, a BF16 model and draft KV cache, a 512 + 64 latent, "
+                    "and an attention backend other than TRITON_MLA."
+                )
 
         self.attn = MLAAttention(
             self.num_heads,

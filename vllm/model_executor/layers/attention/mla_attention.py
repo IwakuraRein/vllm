@@ -1364,7 +1364,14 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 self.kv_cache_dtype
             ),
         )
-        if self.sliding_window is not None:
+        # vLLM's sliding-window KV manager doesn't support DCP. Under DCP a non-causal
+        # draft's window layers keep every token's blocks, as full attention does, and
+        # the backend attends over the window.
+        dcp_full_window = (
+            self.non_causal_multi_token_decode
+            and vllm_config.parallel_config.decode_context_parallel_size > 1
+        )
+        if self.sliding_window is not None and not dcp_full_window:
             return SlidingWindowMLASpec(
                 **common_kwargs,
                 sliding_window=self.sliding_window,

@@ -58,9 +58,18 @@ class TritonMLAMetadataBuilder(MLACommonMetadataBuilder[MLACommonMetadata]):
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
     query_len_support: ClassVar[QueryLenSupport] = QueryLenSupport.UNIFORM
     supports_non_causal_multi_token_decode: ClassVar[bool] = True
+    # Whether a DCP decode batch may hold several query tokens per request; without
+    # it, DCP lowers reorder_batch_threshold to 1.
+    supports_dcp_with_varlen: ClassVar[bool] = False
 
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
-        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        super().__init__(
+            kv_cache_spec,
+            layer_names,
+            vllm_config,
+            device,
+            supports_dcp_with_varlen=self.supports_dcp_with_varlen,
+        )
         # DCP local sequence lengths are not advanced between draft steps.
         self.supports_draft_decode_metadata_update = self.dcp_world_size == 1
         self._reserve_attn_logits_workspace()
@@ -151,6 +160,9 @@ class TritonMLABackend(MLACommonBackend):
 class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
     can_return_lse_for_decode: bool = True
     supports_dcp: bool = True
+    # Whether _forward_windowed_mqa reads a DCP rank's own slots of the window and
+    # returns its LSE.
+    supports_windowed_dcp: bool = False
 
     def __init__(
         self,
@@ -188,7 +200,11 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
                 "TritonMLAImpl does not support one of the following: "
                 "alibi_slopes, logits_soft_cap"
             )
-        if sliding_window is not None and self.dcp_world_size > 1:
+        if (
+            sliding_window is not None
+            and self.dcp_world_size > 1
+            and not self.supports_windowed_dcp
+        ):
             raise NotImplementedError("Windowed Triton MLA does not support DCP.")
         if (
             sliding_window is not None
@@ -351,7 +367,7 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
         kv_cache: torch.Tensor,
         metadata: MLACommonMetadata,
         layer: AttentionLayer,
-    ) -> tuple[torch.Tensor, None]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Attend directly to the latent cache with a per-query sliding window."""
         assert not metadata.causal, "Windowed MLA currently supports draft blocks only."
         assert self.sliding_window is not None
