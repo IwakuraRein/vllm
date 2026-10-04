@@ -693,9 +693,11 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
         flashinfer_prefill_seq_order = None
         if self.use_flashinfer_prefill and num_prefills > 0:
             assert non_spec_query_start_loc is not None
-            flashinfer_prefill_query_start_loc = non_spec_query_start_loc.to(
-                torch.int64
-            )
+            # FlashInfer caches packed metadata using the tensor version counter.
+            with torch.inference_mode(False):
+                flashinfer_prefill_query_start_loc = non_spec_query_start_loc.to(
+                    dtype=torch.int64, copy=True
+                )
             num_non_spec_requests = non_spec_query_start_loc.shape[0] - 1
             num_non_spec_tokens = num_prefill_tokens + num_decode_tokens
             if num_non_spec_tokens > num_non_spec_requests:

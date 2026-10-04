@@ -99,6 +99,7 @@ from vllm.models.deepseek_v4.nvidia.model import (
     DeepseekV4MLP,
 )
 from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import prepare_megamoe_inputs
+from vllm.models.kimi_k3.nvidia.fi_moe import KimiK3MegaMoEExpertsFI
 from vllm.models.kimi_k3.nvidia.kda import KimiK3DeltaAttention
 from vllm.models.kimi_k3.nvidia.latent_moe_runner import (
     LatentMoERunner,
@@ -114,6 +115,7 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.kimi_k3 import KimiK3Config
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
+from vllm.utils.flashinfer_moe_ep import validate_fi_moe_ep_config
 from vllm.utils.math_utils import cdiv
 from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
 from vllm.utils.torch_utils import aux_stream, is_meta_module
@@ -133,6 +135,21 @@ logger = init_logger(__name__)
 # it the GEMMs saturate the device and the cross-stream sync is pure overhead,
 # so it falls back to sequential.
 _ROUTED_DOWN_PROJ_STREAM_TOKEN_THRESHOLD = 256
+
+KIMI_K3_MEGA_MOE_BACKENDS = frozenset(
+    {"deep_gemm_mega_moe", "flashinfer_moe_ep_mega_cutedsl"}
+)
+
+
+def _use_sequence_parallel(vllm_config: VllmConfig) -> bool:
+    parallel_config = vllm_config.parallel_config
+    use_mega_moe = vllm_config.kernel_config.moe_backend in KIMI_K3_MEGA_MOE_BACKENDS
+    return (
+        parallel_config.pipeline_parallel_size == 1
+        and parallel_config.enable_expert_parallel
+        and parallel_config.tensor_parallel_size > 1
+        and (use_mega_moe or parallel_config.data_parallel_size > 1)
+    )
 
 
 def shard_sequence_parallel_mlp(
@@ -511,6 +528,37 @@ class KimiK3MegaMoEExperts(DeepseekV4MegaMoEExperts):
         return y
 
 
+_KIMI_K3_MEGA_MOE_PARAM_SUFFIXES = {
+    "weight_scale_2": "weight_scale_2",
+    "weight_global_scale": "weight_scale_2",
+    "input_global_scale": "input_scale",
+    "input_scale": "input_scale",
+    "weight_scale": "weight_scale",
+    "weight_packed": "weight",
+    "weight": "weight",
+}
+
+
+def map_kimi_k3_mega_moe_expert_weight(
+    name: str, num_experts: int
+) -> tuple[str, int, str] | None:
+    prefix, separator, expert_name = name.rpartition(".experts.")
+    if not separator:
+        return None
+    parts = expert_name.split(".")
+    if len(parts) != 3 or not parts[0].isdigit():
+        return None
+    expert_id = int(parts[0])
+    shard_id = parts[1]
+    param_suffix = _KIMI_K3_MEGA_MOE_PARAM_SUFFIXES.get(parts[2])
+    if expert_id >= num_experts or shard_id not in ("w1", "w2", "w3"):
+        return None
+    if param_suffix is None:
+        return None
+    param_prefix = "w2" if shard_id == "w2" else "w13"
+    return f"{prefix}.experts.{param_prefix}_{param_suffix}", expert_id, shard_id
+
+
 def make_kimi_k3_mega_moe_expert_params_mapping(
     num_experts: int,
 ) -> list[tuple[str, str, int, str]]:
@@ -518,8 +566,7 @@ def make_kimi_k3_mega_moe_expert_params_mapping(
     for expert_id in range(num_experts):
         for shard_id in ("w1", "w2", "w3"):
             param_prefix = "w13" if shard_id in ("w1", "w3") else "w2"
-            for suffix in ("weight_packed", "weight_scale"):
-                param_suffix = "weight" if suffix == "weight_packed" else suffix
+            for suffix, param_suffix in _KIMI_K3_MEGA_MOE_PARAM_SUFFIXES.items():
                 mapping.append(
                     (
                         f"experts.{param_prefix}_{param_suffix}",
@@ -568,9 +615,9 @@ class KimiMoE(nn.Module):
         self.moe_router_activation_func = config.moe_router_activation_func
         self.num_shared_experts = config.num_shared_experts
         self.layer_idx = layer_idx
-        self.use_mega_moe = (
-            vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
-        )
+        moe_backend = vllm_config.kernel_config.moe_backend
+        validate_fi_moe_ep_config(vllm_config)
+        self.use_mega_moe = moe_backend in KIMI_K3_MEGA_MOE_BACKENDS
         if self.use_mega_moe and not vllm_config.parallel_config.enable_expert_parallel:
             raise NotImplementedError(
                 "Kimi K3 MegaMoE requires expert parallel. Enable it with "
@@ -691,7 +738,12 @@ class KimiMoE(nn.Module):
                     f"EP size {ep_size}."
                 )
             num_local_experts = num_experts // ep_size
-            self.experts = KimiK3MegaMoEExperts(
+            experts_cls = (
+                KimiK3MegaMoEExpertsFI
+                if moe_backend == "flashinfer_moe_ep_mega_cutedsl"
+                else KimiK3MegaMoEExperts
+            )
+            self.experts = experts_cls(
                 vllm_config,
                 num_experts=num_experts,
                 num_local_experts=num_local_experts,
@@ -863,7 +915,6 @@ class KimiDecoderLayer(nn.Module):
         layer_idx = self.layer_idx
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
-        parallel_config = vllm_config.parallel_config
         self.is_moe_layer = (
             self.is_moe
             and config.num_experts is not None
@@ -871,13 +922,7 @@ class KimiDecoderLayer(nn.Module):
             and layer_idx % config.moe_layer_freq == 0
         )
 
-        use_mega_moe = vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
-        self.use_sequence_parallel = (
-            parallel_config.pipeline_parallel_size == 1
-            and parallel_config.enable_expert_parallel
-            and parallel_config.tensor_parallel_size > 1
-            and (use_mega_moe or parallel_config.data_parallel_size > 1)
-        )
+        self.use_sequence_parallel = _use_sequence_parallel(vllm_config)
         if config.is_kda_layer(layer_idx):
             kda_config = config.linear_attn_config
             assert kda_config is not None
@@ -1115,14 +1160,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         self.config = config
         self.attn_res_block_size: int | None = config.attn_res_block_size
         self.use_attn_res = self.attn_res_block_size is not None
-        parallel_config = vllm_config.parallel_config
-        use_mega_moe = vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
-        self.use_sequence_parallel = (
-            parallel_config.pipeline_parallel_size == 1
-            and parallel_config.enable_expert_parallel
-            and parallel_config.tensor_parallel_size > 1
-            and (use_mega_moe or parallel_config.data_parallel_size > 1)
-        )
+        self.use_sequence_parallel = _use_sequence_parallel(vllm_config)
 
         self.vocab_size = config.vocab_size
 
@@ -1452,11 +1490,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
             for module in self.modules()
             if isinstance(module, KimiMoE)
         )
-        if self.config.is_moe and use_mega_moe:
-            expert_params_mapping = make_kimi_k3_mega_moe_expert_params_mapping(
-                self.config.num_experts
-            )
-        elif self.config.is_moe:
+        if self.config.is_moe and not use_mega_moe:
             # Params for weights, fp8 weight scales, fp8 activation scales
             # (param_name, weight_name, expert_id, shard_id)
             expert_params_mapping = fused_moe_make_expert_params_mapping(
@@ -1493,6 +1527,24 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
                 # Models trained using ColossalAI may include these tensors in
                 # the checkpoint. Skip them.
                 continue
+            if use_mega_moe:
+                expert_mapping = map_kimi_k3_mega_moe_expert_weight(
+                    name, self.config.num_experts
+                )
+                if expert_mapping is not None:
+                    name, expert_id, expert_shard_id = expert_mapping
+                    if is_pp_missing_parameter(name, self):
+                        continue
+                    param = params_dict[name]
+                    param.weight_loader(
+                        param,
+                        loaded_weight,
+                        name,
+                        expert_id=expert_id,
+                        shard_id=expert_shard_id,
+                    )
+                    loaded_params.add(name)
+                    continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue

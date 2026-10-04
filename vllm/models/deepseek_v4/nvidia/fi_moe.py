@@ -12,6 +12,7 @@ import torch.nn as nn
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.models.deepseek_v4.nvidia.model import DeepseekV4MegaMoEExperts
 from vllm.utils.flashinfer_moe_ep import (
+    build_fi_mega_config,
     build_fi_mega_layer,
     ensure_fi_moe_ep_runtime,
     fi_moe_ep_backend_spec,
@@ -134,11 +135,29 @@ class DeepseekV4MegaMoEExpertsFI(DeepseekV4MegaMoEExperts):
         vllm_config: VllmConfig,
         *,
         activation_clamp: float | None = None,
+        activation: str = "swiglu",
+        situ_beta: float | None = None,
+        situ_linear_beta: float | None = None,
         **kwargs: Any,
     ) -> None:
+        if activation != "swiglu":
+            build_fi_mega_config(
+                intermediate_size=kwargs["intermediate_size"],
+                top_k=kwargs["top_k"],
+                activation_clamp=activation_clamp,
+                megakernel=fi_moe_ep_backend_spec(
+                    vllm_config.kernel_config.moe_backend
+                ).megakernel,
+                activation=activation,
+                situ_beta=situ_beta,
+                situ_linear_beta=situ_linear_beta,
+            )
         super().__init__(vllm_config, **kwargs)
         self._vllm_config = vllm_config
         self._activation_clamp = activation_clamp
+        self._activation = activation
+        self._situ_beta = situ_beta
+        self._situ_linear_beta = situ_linear_beta
         self._mega_layer: MoEEpMegaLayer | None = None
         self._fast_ctx: tuple[Any, Any, Any, int, bool] | None = None
         self._epilogue_alphas: tuple[torch.Tensor, torch.Tensor] | None = None
@@ -267,6 +286,9 @@ class DeepseekV4MegaMoEExpertsFI(DeepseekV4MegaMoEExperts):
             top_k=self.top_k,
             activation_clamp=self._activation_clamp,
             weights=weights,
+            activation=self._activation,
+            situ_beta=self._situ_beta,
+            situ_linear_beta=self._situ_linear_beta,
         )
         del weights
         # Allocate (or attach to) the pooled workspace before first
@@ -323,13 +345,15 @@ class DeepseekV4MegaMoEExpertsFI(DeepseekV4MegaMoEExperts):
         # equivalent toggle, so it is accepted for signature parity only.
         if hidden_states.shape[0] > self.max_num_tokens:
             raise ValueError(
-                f"DeepSeek V4 MegaMoE got {hidden_states.shape[0]} tokens, "
+                f"FlashInfer MegaMoE got {hidden_states.shape[0]} tokens, "
                 f"but the symmetric buffer was sized for {self.max_num_tokens}."
             )
 
         from flashinfer.moe_ep import MoEEpTensors
 
         num_tokens = hidden_states.shape[0]
+        if self.capture_fn is not None:
+            self.capture_fn(topk_ids)
         is_padding = resolve_mega_moe_is_padding(num_tokens)
         topk_ids = apply_mega_moe_routing_preprocess(
             topk_ids,
@@ -339,6 +363,10 @@ class DeepseekV4MegaMoEExpertsFI(DeepseekV4MegaMoEExperts):
         # Fast path: after the first successful full forward the layer is
         # immutable, so skip MoEEpMegaLayer.forward()'s per-call validation
         # and go straight to the kernel backend's stage_inputs + compute.
+        if self._fast_ctx is None:
+            ensure_fi_moe_ep_runtime(self._vllm_config)
+            self.finalize_weights()
+
         alphas = self._epilogue_alphas
         fc1_alpha = alphas[0] if alphas is not None else None
         fc2_alpha = alphas[1] if alphas is not None else None
@@ -368,8 +396,6 @@ class DeepseekV4MegaMoEExpertsFI(DeepseekV4MegaMoEExperts):
             )
             return kernel.compute(workspace, transformed, output=out)
 
-        ensure_fi_moe_ep_runtime(self._vllm_config)
-        self.finalize_weights()
         assert self._mega_layer is not None
 
         y = self._mega_layer.forward(
@@ -389,7 +415,10 @@ class DeepseekV4MegaMoEExpertsFI(DeepseekV4MegaMoEExperts):
                 layer._transformed,
                 layer._fleet_params.token_hidden_size,
                 # zero-copy output views are a cutedsl-backend contract
-                layer._kernel.kernel_name() != "deep_gemm_mega",
+                fi_moe_ep_backend_spec(
+                    self._vllm_config.kernel_config.moe_backend
+                ).megakernel
+                == "nvfp4_cutedsl",
             )
         return y
 

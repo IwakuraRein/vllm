@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import math
-from types import MethodType, SimpleNamespace
+import sys
+from types import MethodType, ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -15,6 +16,7 @@ from vllm.models.common.ops import sequence_parallel as sp_ops
 from vllm.models.kimi_k3.nvidia import model as kimi_model
 from vllm.models.kimi_k3.nvidia import mtp as kimi_mtp
 from vllm.platforms import current_platform
+from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 
 
 class _IdentityNorm(nn.Module):
@@ -132,6 +134,193 @@ def test_moe_sequence_parallel_requires_data_parallel(
     )
 
     assert parallel_config.use_sequence_parallel_moe is expected
+
+
+@pytest.mark.parametrize(
+    "tp_size,enable_ep,pp_size,expected",
+    [
+        (4, True, 1, True),
+        (1, True, 1, False),
+        (4, False, 1, False),
+        (4, True, 2, False),
+    ],
+)
+def test_kimi_cutedsl_mega_moe_enables_sequence_parallel_without_dp(
+    tp_size, enable_ep, pp_size, expected
+):
+    vllm_config = SimpleNamespace(
+        kernel_config=SimpleNamespace(moe_backend="flashinfer_moe_ep_mega_cutedsl"),
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=pp_size,
+            enable_expert_parallel=enable_ep,
+            tensor_parallel_size=tp_size,
+            data_parallel_size=1,
+        ),
+    )
+
+    assert kimi_model._use_sequence_parallel(vllm_config) is expected
+
+
+@pytest.fixture
+def kimi_cutedsl_moe(monkeypatch):
+    """Construct the real MoE adapter with CPU projections and no runtime."""
+    from vllm.models.deepseek_v4.nvidia import fi_moe
+
+    monkeypatch.setattr(fi_moe, "build_fi_mega_config", Mock())
+    monkeypatch.setattr(kimi_model, "get_tensor_model_parallel_world_size", lambda: 4)
+    monkeypatch.setattr(
+        kimi_model,
+        "get_ep_group",
+        lambda: SimpleNamespace(world_size=4, rank_in_group=1),
+    )
+    monkeypatch.setattr(current_platform, "get_device_capability", lambda: None)
+    monkeypatch.setattr(kimi_model, "GateLinear", lambda **kwargs: _Projection())
+    monkeypatch.setattr(
+        kimi_model,
+        "ReplicatedLinear",
+        lambda in_features, out_features, **kwargs: nn.Linear(
+            in_features, out_features, bias=False, dtype=torch.bfloat16
+        ),
+    )
+    monkeypatch.setattr(kimi_model, "aux_stream", lambda: None)
+    monkeypatch.setattr(torch.cuda, "Event", lambda: None)
+
+    def build(
+        moe_backend="flashinfer_moe_ep_mega_cutedsl",
+        situ_beta=1.5,
+        situ_linear_beta=0.25,
+    ):
+        config = KimiLinearConfig(
+            hidden_size=128,
+            moe_intermediate_size=128,
+            num_experts=8,
+            num_experts_per_token=2,
+            num_shared_experts=None,
+            routed_expert_hidden_size=64,
+            hidden_act="situ",
+            activation_situ_beta=situ_beta,
+            activation_situ_linear_beta=situ_linear_beta,
+        )
+        vllm_config = SimpleNamespace(
+            quant_config=None,
+            kernel_config=SimpleNamespace(moe_backend=moe_backend),
+            parallel_config=SimpleNamespace(
+                enable_expert_parallel=True, enable_eplb=False
+            ),
+            scheduler_config=SimpleNamespace(max_num_batched_tokens=8),
+            compilation_config=SimpleNamespace(static_forward_context={}),
+        )
+        return kimi_model.KimiMoE(config, vllm_config, use_sequence_parallel=True)
+
+    return build
+
+
+def test_kimi_moe_selects_cutedsl_experts(kimi_cutedsl_moe):
+    from vllm.models.kimi_k3.nvidia.fi_moe import KimiK3MegaMoEExpertsFI
+
+    moe = kimi_cutedsl_moe()
+
+    assert moe.use_mega_moe
+    assert isinstance(moe.experts, KimiK3MegaMoEExpertsFI)
+    assert moe.experts.num_local_experts == 2
+    assert moe.experts.experts_start_idx == 2
+    assert moe.experts._activation == "situ"
+    assert moe.experts._situ_beta == 1.5
+    assert moe.experts._situ_linear_beta == 0.25
+
+
+def test_kimi_cutedsl_experts_use_default_situ_parameters(kimi_cutedsl_moe):
+    moe = kimi_cutedsl_moe(situ_beta=None, situ_linear_beta=0.0)
+
+    assert moe.experts._situ_beta == 1.0
+    assert moe.experts._situ_linear_beta is None
+
+
+@pytest.mark.parametrize("num_tokens,tp_rank", [(0, 0), (1, 0), (1, 3), (5, 2), (5, 3)])
+def test_kimi_cutedsl_mega_moe_smoke_preserves_local_tokens(
+    monkeypatch, kimi_cutedsl_moe, num_tokens, tp_rank
+):
+    """First and cached forwards mask padding and keep empty ranks participating."""
+    import vllm.forward_context as forward_context
+    from vllm.models.deepseek_v4.nvidia import fi_moe
+
+    moe = kimi_cutedsl_moe()
+    monkeypatch.setattr(sp_ops, "get_tensor_model_parallel_world_size", lambda: 4)
+    monkeypatch.setattr(sp_ops, "get_tensor_model_parallel_rank", lambda: tp_rank)
+    full_input = torch.arange(num_tokens * 128, dtype=torch.float32).reshape(-1, 128)
+    hidden_states = sp_ops.sp_shard(full_input.to(torch.bfloat16))
+    is_padding = sp_ops.sp_padding_mask(None, full_input)
+    monkeypatch.setattr(fi_moe, "_MOE_SKIP_PADDING", True)
+    monkeypatch.setattr(forward_context, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(
+        forward_context,
+        "get_forward_context",
+        lambda: SimpleNamespace(is_padding=is_padding),
+    )
+    monkeypatch.setattr(fi_moe, "ensure_fi_moe_ep_runtime", lambda _: None)
+    flashinfer_moe_ep = ModuleType("flashinfer.moe_ep")
+    monkeypatch.setattr(
+        flashinfer_moe_ep, "MoEEpTensors", SimpleNamespace, raising=False
+    )
+    monkeypatch.setitem(sys.modules, "flashinfer.moe_ep", flashinfer_moe_ep)
+
+    topk_ids = torch.zeros(hidden_states.shape[0], 2, dtype=torch.int32)
+    topk_weights = torch.ones_like(topk_ids, dtype=torch.float32)
+    router = Mock(
+        return_value=(hidden_states[:, :64].contiguous(), topk_weights, topk_ids)
+    )
+    monkeypatch.setattr(moe, "_maybe_overlap_router_and_down_proj", router)
+    with torch.no_grad():
+        moe.routed_expert_up_proj.weight.copy_(torch.eye(64).repeat(2, 1))
+
+    shared = _RecordingMoE()
+    shared_forward = Mock(side_effect=lambda x: x + 3)
+    monkeypatch.setattr(shared, "forward", shared_forward)
+    moe.shared_experts = shared
+    workspace = SimpleNamespace()
+    staged = []
+
+    def stage_inputs(tensors, workspace, *, quantize_input):
+        assert quantize_input
+        staged.append(tensors)
+
+    kernel = SimpleNamespace(
+        stage_inputs=stage_inputs,
+        compute=lambda workspace, transformed, output: staged[-1].hidden_states + 1,
+    )
+
+    def forward(tensors):
+        stage_inputs(tensors, workspace, quantize_input=True)
+        return kernel.compute(workspace, None, output=None)
+
+    layer_forward = Mock(side_effect=forward)
+    moe.experts._mega_layer = SimpleNamespace(
+        forward=layer_forward,
+        _kernel=kernel,
+        _ensure_workspace=lambda: workspace,
+        _transformed=None,
+        _fleet_params=SimpleNamespace(token_hidden_size=64),
+    )
+    alphas = (torch.tensor([1.0, 2.0]), torch.tensor([3.0, 4.0]))
+
+    def finalize_weights():
+        moe.experts._epilogue_alphas = alphas
+
+    monkeypatch.setattr(moe.experts, "finalize_weights", finalize_weights)
+    expected = (hidden_states[:, :64] + 1).repeat(1, 2) + (hidden_states + 3)
+    for _ in range(2):
+        torch.testing.assert_close(moe(hidden_states), expected)
+
+    assert layer_forward.call_count == 1
+    assert len(staged) == router.call_count == shared_forward.call_count == 2
+    for tensors in staged:
+        assert tensors.fc1_alpha is alphas[0]
+        assert tensors.fc2_alpha is alphas[1]
+        torch.testing.assert_close(tensors.hidden_states, hidden_states[:, :64])
+        torch.testing.assert_close(tensors.topk_weights, topk_weights)
+        torch.testing.assert_close(
+            tensors.topk_ids, topk_ids.masked_fill(is_padding[:, None], -1)
+        )
 
 
 def test_kimi_decoder_layer_keeps_moe_states_sequence_sharded(monkeypatch):

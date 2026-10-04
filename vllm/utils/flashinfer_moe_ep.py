@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""FlashInfer ``moe_ep`` helpers for DeepSeek V4 vLLM integration."""
+"""FlashInfer ``moe_ep`` helpers for model-specific MegaMoE integration."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from inspect import signature
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -142,6 +143,9 @@ def ensure_fi_moe_ep_runtime(vllm_config: VllmConfig) -> None:
 
     bootstrap = make_fi_moe_ep_bootstrap()
     spec = fi_moe_ep_backend_spec(vllm_config.kernel_config.moe_backend)
+    if spec.needs_nvshmem:
+        # Weight loading can leave memory cached that NVSHMEM cannot reclaim.
+        torch.accelerator.empty_cache()
     _FI_RUNTIME_HANDLE = bootstrap_moe_ep_runtime(
         bootstrap,
         megakernel_runtime_requirements(spec),
@@ -243,12 +247,24 @@ def build_fi_mega_config(
     top_k: int,
     activation_clamp: float | None,
     megakernel: str,
+    activation: str = "swiglu",
+    situ_beta: float | None = None,
+    situ_linear_beta: float | None = None,
 ):
     from flashinfer.moe_ep import (
         DeepGemmMegaMoeConfig,
         MegaConfig,
         Nvfp4CutedslMegaMoeConfig,
     )
+
+    if activation not in ("swiglu", "situ"):
+        raise ValueError(f"Unsupported FlashInfer MegaMoE activation {activation!r}")
+    if activation == "situ" and megakernel != "nvfp4_cutedsl":
+        raise ValueError("FlashInfer MegaMoE SiTU requires the NVFP4 CuTeDSL kernel.")
+    if activation == "swiglu" and (
+        situ_beta is not None or situ_linear_beta is not None
+    ):
+        raise ValueError("SiTU parameters require activation='situ'.")
 
     # fast_math selects approximate exp/rcp in DeepGEMM's fused SwiGLU
     # epilogue; the cutedsl kernels accept it for API parity only.
@@ -260,11 +276,26 @@ def build_fi_mega_config(
             fast_math=True,
         )
     elif megakernel == "nvfp4_cutedsl":
+        activation_kwargs: dict[str, Any] = {}
+        if activation == "situ":
+            required = {"activation", "situ_beta", "situ_linear_beta"}
+            if not required.issubset(signature(Nvfp4CutedslMegaMoeConfig).parameters):
+                raise RuntimeError(
+                    "FlashInfer NVFP4 CuTeDSL MegaMoE with SiTU requires "
+                    "FlashInfer 0.7.1rc1 or newer (PR #5455). Upgrade "
+                    "flashinfer-python and flashinfer-cubin together."
+                )
+            activation_kwargs = {
+                "activation": activation,
+                "situ_beta": situ_beta,
+                "situ_linear_beta": situ_linear_beta,
+            }
         mk = Nvfp4CutedslMegaMoeConfig(
             intermediate_size=intermediate_size,
             top_k=top_k,
             activation_clamp=activation_clamp,
             fast_math=True,
+            **activation_kwargs,
         )
     else:
         raise ValueError(f"Unsupported fi_moe_ep megakernel {megakernel!r}")
@@ -292,6 +323,9 @@ def build_fi_mega_layer(
     top_k: int,
     activation_clamp: float | None,
     weights,
+    activation: str = "swiglu",
+    situ_beta: float | None = None,
+    situ_linear_beta: float | None = None,
 ) -> MoEEpMegaLayer:
     from flashinfer.moe_ep import FleetParams, MoEEpLayer
 
@@ -303,6 +337,9 @@ def build_fi_mega_layer(
         top_k=top_k,
         activation_clamp=activation_clamp,
         megakernel=megakernel,
+        activation=activation,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
     )
     layer = MoEEpLayer(
         bootstrap=bootstrap,

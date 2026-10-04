@@ -29,6 +29,33 @@ vLLM provides multiple communication backends for EP. Use `--all2all-backend` to
 | `flashinfer_nvlink_one_sided` | MNNVL systems | FlashInfer's one-sided A2A strategy for multi-node NVLink | High-throughput workloads |
 | `flashinfer_nvlink_two_sided` | MNNVL systems | FlashInfer's two-sided A2A strategy for multi-node NVLink | Systems with NVLink across nodes |
 
+### Kimi K3 FlashInfer MegaMoE
+
+On SM100/SM103 GPUs, Kimi K3 supports `--moe-backend flashinfer_moe_ep_mega_cutedsl`
+with `--enable-expert-parallel`. This backend requires NVSHMEM with its Python
+bindings (`nvshmem4py` for your CUDA version) and a FlashInfer build containing
+NVFP4 MegaMoE SiTU support (0.7.1rc1 or newer). Keep the installed FlashInfer
+Python and cubin package versions aligned.
+
+```bash
+vllm serve <kimi-k3-checkpoint> \
+    --tensor-parallel-size 8 \
+    --enable-expert-parallel \
+    --moe-backend flashinfer_moe_ep_mega_cutedsl
+```
+
+The backend uses the model's SiTU gate and linear scales. ModelOpt NVFP4 expert
+weights retain their packed values and scales. MXFP4 expert weights are
+requantized to NVFP4 during loading, which changes the quantization recipe;
+validate model accuracy for your checkpoint.
+
+With pipeline parallel size 1 and tensor parallel size greater than 1, Kimi K3
+automatically enables sequence parallelism, including at data parallel size 1.
+Each TP rank sends its own token shard to MegaMoE and receives results for that
+shard. Padding rows are excluded from routing when `VLLM_MOE_SKIP_PADDING=1`.
+The Ascend-specific FlashComm switch is not used on this CUDA path. EPLB is not
+supported by this backend.
+
 ## Single Node Deployment
 
 ### Configuration

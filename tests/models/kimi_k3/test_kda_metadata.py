@@ -540,6 +540,27 @@ def test_mixed_regular_and_spec_decode_uses_packed_decode_metadata():
     )
 
 
+def test_flashinfer_prefill_offsets_have_version_counter_in_inference_mode():
+    """FlashInfer's packed prefill cache must be able to version its offsets."""
+    builder = _make_builder(
+        KimiK3KDAMetadataBuilder,
+        num_speculative_tokens=0,
+        full_cuda_graph=False,
+    )
+    builder.use_flashinfer_prefill = True
+    with torch.inference_mode():
+        common = create_common_attn_metadata(
+            BatchSpec(seq_lens=[7, 3], query_lens=[7, 3]), BLOCK_SIZE, DEVICE
+        ).replace(is_prefilling=torch.tensor([True, True]))
+        actual = builder.build(0, common)
+
+    offsets = actual.flashinfer_prefill_query_start_loc
+    assert offsets is not None
+    torch.testing.assert_close(offsets, torch.tensor([0, 7, 10], dtype=torch.int64))
+    assert not torch.is_inference(offsets)
+    assert offsets._version >= 0
+
+
 def test_mixed_regular_and_spec_decode_excludes_request_padding():
     batch = BatchSpec(seq_lens=[16, 65, 20], query_lens=[0, 1, 3])
     common_attn_metadata = create_common_attn_metadata(
