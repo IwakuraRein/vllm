@@ -1574,6 +1574,32 @@ def test_all2all_backend_has_portable_default():
     assert ParallelConfig().all2all_backend == "allgather_reducescatter"
 
 
+@pytest.mark.parametrize(
+    "tp_size,dp_size,enable_ep,backend,expected_all2all,expected_sp",
+    [
+        (8, 1, True, "allgather_reducescatter", True, False),
+        (8, 1, False, "allgather_reducescatter", False, False),
+        (1, 1, True, "allgather_reducescatter", False, False),
+        (8, 1, True, "deepep_high_throughput", False, False),
+        (8, 2, True, "allgather_reducescatter", True, True),
+        (8, 2, False, "allgather_reducescatter", True, False),
+    ],
+)
+def test_all2all_initializes_for_model_sequence_parallelism(
+    tp_size, dp_size, enable_ep, backend, expected_all2all, expected_sp
+):
+    """DP=1 SP can dispatch without changing other models' default MoE layout."""
+    config = ParallelConfig(
+        tensor_parallel_size=tp_size,
+        data_parallel_size=dp_size,
+        enable_expert_parallel=enable_ep,
+        all2all_backend=backend,
+        distributed_executor_backend="mp",
+    )
+    assert config.use_all2all is expected_all2all
+    assert config.use_sequence_parallel_moe is expected_sp
+
+
 def test_dp_group_uses_configured_timeout_without_current_config(monkeypatch):
     monkeypatch.setattr(vllm_config_module, "_current_vllm_config", None)
     config = ParallelConfig(cpu_distributed_timeout_seconds=30)

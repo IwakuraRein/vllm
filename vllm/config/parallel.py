@@ -772,6 +772,13 @@ class ParallelConfig:
         return (
             self.data_parallel_size > 1
             or self.use_sequence_parallel_moe
+            # Models can opt into SP with DP=1 independently of the default
+            # MoE layout; their EP group still needs dispatch/combine support.
+            or (
+                self.enable_expert_parallel
+                and self.tensor_parallel_size > 1
+                and self.all2all_backend == "allgather_reducescatter"
+            )
             or (self.enable_expert_parallel and self.prefill_context_parallel_size > 1)
         )
 

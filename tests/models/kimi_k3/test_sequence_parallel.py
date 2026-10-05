@@ -67,15 +67,19 @@ class _SequenceParallelMTPBlock:
 
 
 def _mock_sequence_parallel_collectives(monkeypatch):
+    def shard(tensor):
+        padded = torch.nn.functional.pad(tensor, (0, 0, 0, tensor.shape[0] % 2))
+        return padded.chunk(2, dim=0)[0]
+
     monkeypatch.setattr(
         kimi_model,
         "sp_reduce_scatter",
-        lambda tensor: tensor.chunk(2, dim=0)[0],
+        shard,
     )
     monkeypatch.setattr(
         kimi_model,
         "sp_shard",
-        lambda tensor: torch.nn.functional.pad(tensor, (0, 0, 0, 1))[:2],
+        shard,
     )
     monkeypatch.setattr(
         kimi_model,
@@ -134,7 +138,65 @@ def test_moe_sequence_parallel_requires_data_parallel(
     assert parallel_config.use_sequence_parallel_moe is expected
 
 
-def test_kimi_decoder_layer_keeps_moe_states_sequence_sharded(monkeypatch):
+@pytest.mark.parametrize("moe_backend", ["flashinfer_cutedsl", "flashinfer_trtllm"])
+@pytest.mark.parametrize(
+    ("tp_size", "dp_size", "pp_size", "enable_ep", "all2all_backend", "expected"),
+    [
+        (8, 1, 1, True, "allgather_reducescatter", True),
+        (8, 2, 1, True, "allgather_reducescatter", True),
+        (1, 1, 1, True, "allgather_reducescatter", False),
+        (8, 1, 2, True, "allgather_reducescatter", False),
+        (8, 1, 1, False, "allgather_reducescatter", False),
+        (8, 1, 1, True, "deepep_low_latency", False),
+    ],
+)
+def test_kimi_sequence_parallel_with_nvfp4_moe_backends(
+    moe_backend,
+    tp_size,
+    dp_size,
+    pp_size,
+    enable_ep,
+    all2all_backend,
+    expected,
+):
+    vllm_config = SimpleNamespace(
+        kernel_config=SimpleNamespace(moe_backend=moe_backend),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=tp_size,
+            data_parallel_size=dp_size,
+            pipeline_parallel_size=pp_size,
+            enable_expert_parallel=enable_ep,
+            all2all_backend=all2all_backend,
+        ),
+    )
+
+    assert kimi_model.use_sequence_parallel(vllm_config) is expected
+
+
+@pytest.mark.parametrize(
+    ("moe_backend", "expected"),
+    [
+        ("deep_gemm_mega_moe", True),
+        ("flashinfer_moe_ep_mega_cutedsl", False),
+    ],
+)
+def test_kimi_sequence_parallel_preserves_mega_backend_support(moe_backend, expected):
+    vllm_config = SimpleNamespace(
+        kernel_config=SimpleNamespace(moe_backend=moe_backend),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=8,
+            data_parallel_size=1,
+            pipeline_parallel_size=1,
+            enable_expert_parallel=True,
+            all2all_backend="passthrough",
+        ),
+    )
+
+    assert kimi_model.use_sequence_parallel(vllm_config) is expected
+
+
+@pytest.mark.parametrize("num_tokens", [1, 3, 8])
+def test_kimi_decoder_layer_keeps_moe_states_sequence_sharded(monkeypatch, num_tokens):
     layer = object.__new__(kimi_model.KimiDecoderLayer)
     nn.Module.__init__(layer)
     layer.use_attn_res = False
@@ -149,9 +211,12 @@ def test_kimi_decoder_layer_keeps_moe_states_sequence_sharded(monkeypatch):
 
     _mock_sequence_parallel_collectives(monkeypatch)
 
-    positions = torch.arange(3)
-    full_hidden_states = torch.arange(6, dtype=torch.float32).view(3, 2)
+    positions = torch.arange(num_tokens)
+    full_hidden_states = torch.arange(num_tokens * 2, dtype=torch.float32).view(
+        num_tokens, 2
+    )
     hidden_states = kimi_model.sp_shard(full_hidden_states)
+    expected_shard = hidden_states.clone()
     hidden_states, prefix_sum, residual = layer(
         positions=positions,
         hidden_states=hidden_states,
@@ -159,8 +224,9 @@ def test_kimi_decoder_layer_keeps_moe_states_sequence_sharded(monkeypatch):
     )
 
     assert prefix_sum is None
-    assert hidden_states.shape == residual.shape == (2, 2)
-    assert layer.mlp.num_tokens == 2
+    torch.testing.assert_close(hidden_states, expected_shard)
+    torch.testing.assert_close(residual, expected_shard)
+    assert layer.mlp.num_tokens == math.ceil(num_tokens / 2)
 
     hidden_states, prefix_sum, residual = layer(
         positions=positions,
@@ -169,8 +235,9 @@ def test_kimi_decoder_layer_keeps_moe_states_sequence_sharded(monkeypatch):
     )
 
     assert prefix_sum is None
-    assert hidden_states.shape == residual.shape == (2, 2)
-    assert layer.mlp.num_tokens == 2
+    torch.testing.assert_close(hidden_states, expected_shard)
+    torch.testing.assert_close(residual, expected_shard)
+    assert layer.mlp.num_tokens == math.ceil(num_tokens / 2)
 
 
 def test_kimi_attn_residual_states_stay_sequence_sharded(monkeypatch):
