@@ -44,8 +44,6 @@ def test_dispatch_sizes_expand_pcp_before_tp(pcp_size, sp_size, enable_ep, expec
         (2, 2, 2, False, False, "dp"),
         (2, 1, 2, True, False, "dp"),
         (1, 2, 2, True, False, "pcp"),
-        (1, 1, 8, True, True, "ep"),
-        (1, 1, 8, True, False, "pcp"),
         (2, 2, 2, True, False, None),
     ],
 )
@@ -126,47 +124,6 @@ def test_ag_rs_dispatch_and_combine_use_dp_pcp_sizes(monkeypatch, enable_ep):
     assert combined.tolist() == local_tokens
     sizes = [1, 1, 2, 2] if enable_ep else [2, 4]
     assert calls == [("gather", sizes), ("scatter", sizes)]
-
-
-def test_ag_rs_sequence_parallel_dispatch_without_dp_metadata(monkeypatch):
-    """DP=1 gathers token shards and quantization scales across the EP group."""
-    calls = []
-
-    class FakeGroup:
-        world_size = 8
-        rank_in_group = 3
-
-        def all_gatherv(self, tensors, dim, sizes):
-            calls.append(("gather", sizes))
-            return [
-                torch.cat([tensor] * self.world_size, dim=dim) for tensor in tensors
-            ]
-
-        def reduce_scatterv(self, tensor, dim, sizes):
-            calls.append(("scatter", sizes))
-            return tensor.chunk(self.world_size, dim=dim)[self.rank_in_group]
-
-    monkeypatch.setattr(
-        "vllm.distributed.device_communicators.all2all.get_ep_group", FakeGroup
-    )
-    manager = AgRsAll2AllManager.__new__(AgRsAll2AllManager)
-    manager.dp_world_size = 1
-    hidden = torch.arange(6).reshape(2, 3)
-    weights = torch.ones(2, 1)
-    ids = torch.zeros(2, 1, dtype=torch.long)
-    scales = torch.ones(2, 3)
-
-    gathered, gathered_weights, gathered_ids, extra = manager.dispatch(
-        hidden, weights, ids, is_sequence_parallel=True, extra_tensors=[scales]
-    )
-    for actual, local in zip(
-        (gathered, gathered_weights, gathered_ids, extra[0]),
-        (hidden, weights, ids, scales),
-    ):
-        torch.testing.assert_close(actual, torch.cat([local] * 8))
-    combined = manager.combine(gathered, is_sequence_parallel=True)
-    torch.testing.assert_close(combined, hidden)
-    assert calls == [("gather", [2] * 8), ("scatter", [2] * 8)]
 
 
 @pytest.mark.parametrize("slots", [[3, 4], [3, 4, -1, -1, -1, -1]])
