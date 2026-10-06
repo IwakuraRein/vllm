@@ -3,6 +3,7 @@
 
 from collections.abc import Callable
 from dataclasses import replace
+from math import lcm
 
 import torch
 from einops import rearrange
@@ -830,8 +831,16 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         spec = super().get_kv_cache_spec(vllm_config)
         assert isinstance(spec, MambaSpec)
         alignment = kda_prefill_checkpoint_alignment(self.kda_prefill_backend)
+        block_stride_alignment = spec.block_stride_alignment
+        if self.kda_spec_decode_backend == "flashinfer":
+            # Packed FlashInfer kernels require 16-element state-slot strides.
+            block_stride_alignment = lcm(
+                block_stride_alignment or 1,
+                *(16 * dtype.itemsize for dtype in spec.dtypes[:2]),
+            )
         return replace(
             spec,
+            block_stride_alignment=block_stride_alignment,
             num_prefill_checkpoint_blocks=int(alignment is not None),
             prefill_checkpoint_alignment=alignment,
         )

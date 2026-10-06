@@ -360,6 +360,11 @@ def _canonicalize_sparse_mla_kv_cache_dtype(
     kv_cache_dtype: CacheDType,
 ) -> CacheDType:
     backend_name = attn_backend.get_name()
+    if backend_name == "FLASHMLA_WINDOWED" and kv_cache_dtype in (
+        "fp8",
+        "fp8_e4m3",
+    ):
+        return "fp8_ds_mla"
     if backend_name == "FLASHMLA_SPARSE" and is_quantized_kv_cache(kv_cache_dtype):
         # The NVFP4 DS-MLA format is used as-is; any other quantized dtype
         # (fp8, fp8_e4m3, ...) is served via the fp8_ds_mla format.
@@ -1371,20 +1376,22 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             self.non_causal_multi_token_decode
             and vllm_config.parallel_config.decode_context_parallel_size > 1
         )
+        spec: MLAAttentionSpec | SlidingWindowMLASpec
         if self.sliding_window is not None and not dcp_full_window:
-            return SlidingWindowMLASpec(
+            spec = SlidingWindowMLASpec(
                 **common_kwargs,
                 sliding_window=self.sliding_window,
                 non_causal_multi_token_decode=self.non_causal_multi_token_decode,
             )
-        spec = MLAAttentionSpec(
-            **common_kwargs,
-            is_index_group_leader=self.indexer is not None,
-            non_causal_multi_token_decode=self.non_causal_multi_token_decode,
-        )
+        else:
+            spec = MLAAttentionSpec(
+                **common_kwargs,
+                is_index_group_leader=self.indexer is not None,
+                non_causal_multi_token_decode=self.non_causal_multi_token_decode,
+            )
         # SM100 FlashMLA paged kernels also express TMA coordinates in token rows.
         uses_tma_rows = (
-            self.attn_backend.get_name() == "FLASHMLA_SPARSE"
+            self.attn_backend.get_name() in ("FLASHMLA_SPARSE", "FLASHMLA_WINDOWED")
             and self.kv_cache_dtype in ("fp8_ds_mla", "nvfp4_ds_mla")
             and current_platform.is_device_capability_family(100)
         )
@@ -2433,7 +2440,11 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             self.determine_chunked_prefill_workspace_size(vllm_config)
         )
 
-        use_packed_fp8_cache = vllm_config.cache_config.cache_dtype == "fp8_ds_mla"
+        cache_dtype = (
+            getattr(kv_cache_spec, "cache_dtype_str", None)
+            or vllm_config.cache_config.cache_dtype
+        )
+        use_packed_fp8_cache = cache_dtype == "fp8_ds_mla"
         self.dcp_manager: MLADCPManager | None = None
         if self.dcp_world_size > 1:
             # Note(hc): The local kvcache is incomplete when DCP is triggered,

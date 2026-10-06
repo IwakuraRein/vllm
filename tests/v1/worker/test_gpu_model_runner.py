@@ -50,6 +50,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheTensor,
 )
+from vllm.v1.kv_cache_layout import KVCacheLayout
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
@@ -484,6 +485,58 @@ def test_preferred_block_size_rejects_backends_with_no_common_size():
     classes = [_mock_backend([16], exact=True), _mock_backend([MultipleOf(64)])]
     with pytest.raises(ValueError, match="share no supported KV cache block size"):
         Platform._preferred_block_size_for_backends(classes, 16, None)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize(
+    "packed,indexer_alignment", [(False, None), (True, None), (True, 128)]
+)
+@pytest.mark.parametrize("mamba_mode", ["none", "align"])
+@pytest.mark.parametrize("requested_block_size", [None, 64, 896])
+def test_hybrid_packed_layout_keeps_native_kernel_blocks(
+    monkeypatch, packed, indexer_alignment, mamba_mode, requested_block_size
+):
+    backend = _mock_backend([32, 64])
+    if packed:
+        monkeypatch.setattr(
+            backend,
+            "supported_kv_cache_layouts",
+            lambda: (KVCacheLayout.BLNHC, KVCacheLayout.BLHNC),
+        )
+    cache_config = CacheConfig(
+        block_size=requested_block_size,
+        mamba_cache_mode=mamba_mode,
+        mamba_block_size=1048576,
+    )
+    config = SimpleNamespace(
+        cache_config=cache_config, model_config=SimpleNamespace(is_hybrid=True)
+    )
+    monkeypatch.setattr(Platform, "_find_non_ssm_backends", lambda _: [backend])
+    monkeypatch.setattr(
+        Platform, "_get_indexer_block_alignment", lambda _: indexer_alignment
+    )
+
+    def align_hybrid(config, backend):
+        config.cache_config.block_size = 896
+        config.cache_config.mamba_page_size_padded = 896 * 576
+        if config.cache_config.mamba_cache_mode == "align":
+            config.cache_config.mamba_block_size = 896
+
+    monkeypatch.setattr(Platform, "_align_hybrid_block_size", align_hybrid)
+    Platform.update_block_size_for_backend(config)
+
+    if packed and indexer_alignment is None:
+        expected = 32 if requested_block_size is None else 64
+        assert cache_config.block_size == expected
+        assert cache_config.mamba_page_size_padded is None
+    else:
+        expected = 896
+        assert cache_config.block_size == expected
+        assert cache_config.mamba_page_size_padded == 896 * 576
+    assert cache_config.mamba_block_size == (
+        expected if mamba_mode == "align" else 1048576
+    )
 
 
 def test_set_active_mm_loras_builds_tower_and_connector_mappings():

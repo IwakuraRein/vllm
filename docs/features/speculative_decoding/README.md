@@ -106,6 +106,33 @@ only apply to model-based methods such as `draft_model`, `mtp`, `eagle3`, and
 
 ### Method-specific keys
 
+#### DFlash MLA with FP8 cache
+
+For a compatible DFlash/DFlash2 MLA checkpoint, enable FP8 draft caching with:
+
+```bash
+vllm serve /path/to/target --dtype bfloat16 \
+  --speculative-config '{
+    "method": "dflash",
+    "model": "/path/to/draft",
+    "num_speculative_tokens": 7,
+    "kv_cache_dtype": "fp8",
+    "attention_backend": "FLASHINFER_MLA"
+  }'
+```
+
+Use the proposal count the checkpoint was trained for. On supported Hopper and
+Blackwell GPUs, windowed layers with a 512-dimensional latent and 64 RoPE
+dimensions use FlashMLA's packed FP8 cache: FP8 latent values, per-group scales,
+and BF16 RoPE values (656 bytes per token). Full-attention layers keep plain FP8
+caching with FlashInfer MLA. Queries to the windowed kernel remain BF16.
+
+The windowed backend selects a block-outermost cache layout (`BLNHC` or `BLHNC`)
+so these different cache formats can share an allocation without enlarging every
+layer's page. Leave `VLLM_KV_CACHE_LAYOUT` unset, or select a compatible layout.
+Decode context parallelism requires `cp_kv_cache_interleave_size=1`.
+An explicit `TRITON_MLA` backend continues to use plain FP8 window attention.
+
 #### N-gram
 
 | Key | Type | Default | Meaning |

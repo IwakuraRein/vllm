@@ -668,6 +668,7 @@ class Platform:
         For hybrid models, also aligns block_size with mamba page sizes.
         """
         from vllm.config.cache import CacheConfig
+        from vllm.v1.attention.backends.utils import get_supported_kv_cache_layouts
 
         cache_config = vllm_config.cache_config
         model_config = vllm_config.model_config
@@ -699,7 +700,27 @@ class Platform:
         # Phase 2: Align block/mamba sizes for hybrid models
         # (may override user settings).
         if model_config.is_hybrid:
-            cls._align_hybrid_block_size(vllm_config, backend_classes[0])
+            layouts = get_supported_kv_cache_layouts(backend_classes)
+            if all(layout.is_block_outermost for layout in layouts) and (
+                cls._get_indexer_block_alignment(vllm_config) is None
+            ):
+                from vllm.v1.worker.utils import select_common_block_size
+
+                # Packed groups need no equal-sized pages. Keep native kernel
+                # blocks: interleaved pages cannot be virtually subdivided.
+                block_size = select_common_block_size(
+                    cache_config.block_size, backend_classes
+                )
+                if block_size != cache_config.block_size:
+                    logger.info(
+                        "Using native attention block size %d for packed KV caches.",
+                        block_size,
+                    )
+                    cache_config.block_size = block_size
+                if cache_config.mamba_cache_mode == "align":
+                    cache_config.mamba_block_size = block_size
+            else:
+                cls._align_hybrid_block_size(vllm_config, backend_classes[0])
 
         # Phase 3: Align block/page sizes when multiple KV dtypes share the
         # block pool (e.g. nvfp4 primary + unquantized skip layers).

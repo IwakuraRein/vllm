@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from dataclasses import replace
+
 import torch
 from torch import nn
 
@@ -122,28 +124,34 @@ class DFlashMLAAttention(nn.Module):
         if sliding_window is not None:
             from vllm.v1.attention.backends.mla.flashmla_windowed import (
                 FlashMLAWindowedBackend,
+                FlashMLAWindowedFP8Backend,
             )
             from vllm.v1.attention.ops.flashmla import is_flashmla_sparse_supported
 
             vllm_config = get_current_vllm_config()
             attn_backend = TritonMLABackend
+            cache_dtype = cache_config.cache_dtype if cache_config else "auto"
             if (
                 vllm_config.attention_config.backend != AttentionBackendEnum.TRITON_MLA
                 and vllm_config.model_config.dtype == torch.bfloat16
-                and (
-                    cache_config is None
-                    or cache_config.cache_dtype in ("auto", "bfloat16")
-                )
+                and cache_dtype in ("auto", "bfloat16", "fp8", "fp8_e4m3", "fp8_ds_mla")
                 and self.kv_lora_rank == 512
                 and self.qk_rope_head_dim == 64
                 and is_flashmla_sparse_supported()[0]
             ):
-                attn_backend = FlashMLAWindowedBackend
+                if cache_dtype in ("fp8", "fp8_e4m3", "fp8_ds_mla"):
+                    attn_backend = FlashMLAWindowedFP8Backend
+                    # Canonicalizing the window cache must not change full layers.
+                    assert cache_config is not None
+                    cache_config = replace(cache_config)
+                else:
+                    attn_backend = FlashMLAWindowedBackend
             elif use_dcp:
                 raise ValueError(
                     "MLA DFlash with decode context parallelism runs its window "
                     "layers on FLASHMLA_WINDOWED, which needs FlashMLA sparse "
-                    "support, a BF16 model and draft KV cache, a 512 + 64 latent, "
+                    "support, a BF16 model, BF16 or FP8 draft KV cache, "
+                    "a 512 + 64 latent, "
                     "and an attention backend other than TRITON_MLA."
                 )
 

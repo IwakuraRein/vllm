@@ -5,10 +5,11 @@ from typing import ClassVar
 
 import torch
 
+from vllm.config.cache import CacheDType
 from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadata
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
-from vllm.v1.attention.backend import AttentionLayer
+from vllm.v1.attention.backend import AttentionLayer, KVCacheLayout
 from vllm.v1.attention.backends.mla.triton_mla import (
     TritonMLABackend,
     TritonMLAImpl,
@@ -16,6 +17,8 @@ from vllm.v1.attention.backends.mla.triton_mla import (
 )
 from vllm.v1.attention.ops.flashmla import (
     flash_mla_sparse_fwd,
+    flash_mla_with_kvcache,
+    get_mla_metadata,
     is_flashmla_sparse_supported,
 )
 
@@ -116,13 +119,33 @@ class FlashMLAWindowedImpl(TritonMLAImpl):
         layer: AttentionLayer,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         dcp = self.dcp_world_size > 1
+        packed_fp8 = self.kv_cache_dtype == "fp8_ds_mla"
+        cache_supported = (
+            kv_cache.dtype == torch.uint8
+            and kv_cache.shape[-1] == 656
+            and kv_cache.stride(-1) == 1
+            and kv_cache.stride(-2) == 656
+            and (
+                kv_cache.stride(0) % 656 == 0
+                or not current_platform.is_device_capability_family(100)
+            )
+            if packed_fp8
+            else kv_cache.dtype == torch.bfloat16
+            and kv_cache.shape[-1] == 576
+            and kv_cache.is_contiguous()
+        )
         if not (
             is_flashmla_sparse_supported()[0]
-            and q.dtype == kv_cache.dtype == torch.bfloat16
-            and q.shape[-1] == kv_cache.shape[-1] == 576
+            and q.dtype == torch.bfloat16
+            and q.shape[-1] == 576
             and self.kv_lora_rank == 512
-            and kv_cache.is_contiguous()
+            and cache_supported
         ):
+            if packed_fp8:
+                raise NotImplementedError(
+                    "Windowed FP8 FlashMLA requires BF16 queries, a 512 + 64 "
+                    "latent and a row-aligned fp8_ds_mla cache."
+                )
             if dcp:
                 raise NotImplementedError(
                     "Windowed MLA with DCP needs the FlashMLA path: a BF16 KV "
@@ -166,19 +189,49 @@ class FlashMLAWindowedImpl(TritonMLAImpl):
             CP_WORLD=self.dcp_world_size,
         )
         num_heads = q.shape[1]
-        alignment = 64 if current_platform.is_device_capability_family(90) else 128
+        alignment = (
+            64
+            if packed_fp8 or current_platform.is_device_capability_family(90)
+            else 128
+        )
         padded_heads = triton.cdiv(num_heads, alignment) * alignment
+        if packed_fp8 and padded_heads not in (64, 128):
+            raise NotImplementedError("FP8 FlashMLA supports at most 128 query heads.")
         if num_heads != padded_heads:
             padded_q = q.new_zeros((q.shape[0], padded_heads, q.shape[2]))
             padded_q[:, :num_heads] = q
             q = padded_q
-        output, _, lse = flash_mla_sparse_fwd(
-            q,
-            kv_cache.view(-1, 1, 576),
-            indices,
-            self.scale,
-            topk_length=lengths,
-        )
+        if packed_fp8:
+            # Record scheduler generation in every graph: window lengths change
+            # on replay, so initialized scheduling metadata cannot be reused.
+            scheduler, splits = get_mla_metadata()
+            output, lse = flash_mla_with_kvcache(
+                q.unsqueeze(1),
+                kv_cache.unsqueeze(2),
+                None,
+                None,
+                self.kv_lora_rank,
+                scheduler,
+                splits,
+                softmax_scale=self.scale,
+                is_fp8_kvcache=True,
+                indices=indices,
+                topk_length=(
+                    lengths
+                    if current_platform.is_device_capability_family(100)
+                    else None
+                ),
+            )
+            output = output.squeeze(1)
+            lse = lse.squeeze(-1)
+        else:
+            output, _, lse = flash_mla_sparse_fwd(
+                q,
+                kv_cache.view(-1, 1, 576),
+                indices,
+                self.scale,
+                topk_length=lengths,
+            )
         output = output[:, :num_heads].contiguous()
         if not dcp:
             return output, None
@@ -189,3 +242,17 @@ class FlashMLAWindowedImpl(TritonMLAImpl):
         lse = lse[:, :num_heads].contiguous()
         lse.masked_fill_(empty.view(-1, 1), float("-inf"))
         return output, lse
+
+
+class FlashMLAWindowedFP8Backend(FlashMLAWindowedBackend):
+    """Packed FP8 windows sharing an allocation with other cache formats."""
+
+    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
+        "fp8",
+        "fp8_e4m3",
+        "fp8_ds_mla",
+    ]
+
+    @classmethod
+    def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
+        return (KVCacheLayout.BLNHC, KVCacheLayout.BLHNC)

@@ -61,6 +61,7 @@ from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.l2norm import l2norm_fwd
 from vllm.utils.flashinfer import flashinfer_fused_kda_decode
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+from vllm.v1.kv_cache_interface import MambaSpec
 
 DEVICE = current_platform.device_type
 
@@ -111,6 +112,42 @@ def test_resolve_kda_spec_decode_backend(monkeypatch: pytest.MonkeyPatch):
     assert resolve_kda_spec_decode_backend("auto", *args, False) == "native"
     with pytest.raises(RuntimeError, match="packed_fused_kda_decode"):
         resolve_kda_spec_decode_backend("flashinfer", *args, False)
+
+
+@pytest.mark.parametrize(
+    "backend,state_dtype,existing_alignment,expected_alignment",
+    [
+        ("native", torch.bfloat16, None, None),
+        ("native", torch.bfloat16, 656, 656),
+        ("flashinfer", torch.bfloat16, None, 32),
+        ("flashinfer", torch.float32, None, 64),
+        ("flashinfer", torch.bfloat16, 656, 1312),
+        ("flashinfer", torch.float32, 656, 2624),
+    ],
+)
+def test_kda_cache_spec_preserves_flashinfer_state_slot_alignment(
+    monkeypatch, backend, state_dtype, existing_alignment, expected_alignment
+):
+    """A shared pool must preserve packed KDA's 16-element stride contract."""
+    base = MambaSpec(
+        block_size=64,
+        shapes=((10, 4608), (12, 128, 128)),
+        dtypes=(torch.bfloat16, state_dtype),
+        block_stride_alignment=existing_alignment,
+    )
+    monkeypatch.setattr(
+        nvidia_kda.GatedDeltaNetAttention,
+        "get_kv_cache_spec",
+        lambda self, config: base,
+    )
+    layer = object.__new__(KimiK3DeltaAttention)
+    object.__setattr__(layer, "kda_prefill_backend", "triton")
+    object.__setattr__(layer, "kda_spec_decode_backend", backend)
+
+    spec = layer.get_kv_cache_spec(None)
+
+    assert spec.block_stride_alignment == expected_alignment
+    assert base.block_stride_alignment == existing_alignment
 
 
 def test_kda_recoverssm_config_state_layout():
